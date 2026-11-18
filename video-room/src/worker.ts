@@ -8,10 +8,13 @@ import {
   authenticateRequest,
   RequestError,
   type AuthEnv,
+  type AuthenticatedPrincipal,
 } from "./server/auth";
 import { errorResponse, rpcResponse } from "./server/http";
 import type { RealtimeEnv } from "./server/realtime";
 import { type RoomRpcContext, VideoRoom } from "./server/video-room";
+import { RecordingDO } from "./RecordingDO";
+import { RoomDO } from "./RoomDO";
 import {
   API_HEADER_MEMBER_TOKEN,
   joinRequestSchema,
@@ -22,9 +25,20 @@ import {
   subscribeRequestSchema,
 } from "./shared/protocol";
 
-export { VideoRoom };
+export { RecordingDO, RoomDO, VideoRoom };
 
-type WorkerEnv = Env & AuthEnv & RealtimeEnv;
+type WorkerEnv = Env &
+  AuthEnv &
+  RealtimeEnv & {
+    ROOM_PASSWORD_REQUIRED?: string;
+  };
+type ExtendedWorkerEnv = WorkerEnv & {
+  AI?: Ai;
+  RECORDINGS?: R2Bucket;
+  RECORDING_DO?: DurableObjectNamespace<RecordingDO>;
+  ROOM_DO?: DurableObjectNamespace<RoomDO>;
+  WORKER_HOSTNAME?: string;
+};
 type RoomEnv = {
   Bindings: WorkerEnv;
   Variables: {
@@ -63,10 +77,24 @@ app.use(roomRoute, async (c, next) => {
 
   if (c.req.method === "GET" && c.req.param("action") === "socket") {
     assertSameOrigin(c.req.raw);
+    await checkRoomPassword(
+      c.env,
+      roomId.data,
+      c.req.query("password"),
+      false,
+    );
     return next();
   }
   if (c.req.method !== "GET") assertSameOrigin(c.req.raw);
-  const principal = await authenticateRequest(c.req.raw, c.env);
+  const principal = await authenticateApplicationRequest(c.req.raw, c.env);
+  if (c.req.param("action") !== "join") {
+    await checkRoomPassword(
+      c.env,
+      roomId.data,
+      c.req.header("x-room-password"),
+      false,
+    );
+  }
   c.set("rpc", {
     memberToken: c.req.header(API_HEADER_MEMBER_TOKEN) ?? null,
     principal,
@@ -99,13 +127,19 @@ app.get("/socket", (c) => {
   );
 });
 
-app.post("/join", jsonRequest(joinRequestSchema, withDisplayHint), async (c) =>
-  rpcResponse(
+app.post("/join", jsonRequest(joinRequestSchema, withDisplayHint), async (c) => {
+  await checkRoomPassword(
+    c.env,
+    c.get("roomId"),
+    c.req.header("x-room-password"),
+    true,
+  );
+  return rpcResponse(
     await c.get("room").join(c.get("rpc"), c.req.valid("json")),
     c.get("requestId"),
     201,
-  ),
-);
+  );
+});
 app.post(
   "/reconnect",
   jsonRequest(reconnectRequestSchema, withDisplayHint),
@@ -162,7 +196,234 @@ app.onError((error, c) =>
   errorResponse(error, c.get("requestId") ?? crypto.randomUUID()),
 );
 
-export default app;
+type RootEnv = { Bindings: ExtendedWorkerEnv };
+const worker = new Hono<RootEnv>();
+worker.all("*", async (c) => {
+  const response = await handleExtendedRoute(c.req.raw, c.env);
+  if (response) return response;
+  return app.fetch(c.req.raw, c.env);
+});
+worker.notFound((c) => c.env.ASSETS.fetch(c.req.raw));
+worker.onError((error) => errorResponse(error, crypto.randomUUID()));
+
+export default worker;
+
+async function handleExtendedRoute(
+  request: Request,
+  env: ExtendedWorkerEnv,
+): Promise<Response | undefined> {
+  const url = new URL(request.url);
+  const roomBinding = () => {
+    if (!env.ROOM_DO) {
+      throw new RequestError(503, "room_binding_missing", "Room services are not configured.");
+    }
+    return env.ROOM_DO.getByName(validRoom(url.searchParams.get("room")));
+  };
+  const recordingBinding = () => {
+    if (!env.RECORDING_DO) {
+      throw new RequestError(503, "recording_binding_missing", "Recording services are not configured.");
+    }
+    return env.RECORDING_DO.getByName(validRoom(url.searchParams.get("room")));
+  };
+
+  if (url.pathname === "/ws/room" && request.method === "GET") {
+    assertSameOrigin(request);
+    const principal = await authenticateWebSocket(request, env);
+    const room = validRoom(url.searchParams.get("room"));
+    await checkRoomPassword(
+      env,
+      room,
+      url.searchParams.get("password"),
+      false,
+    );
+    return roomBinding().fetch(
+      new Request("https://room.internal/socket", {
+        headers: {
+          upgrade: "websocket",
+          "x-room-subject": principal.subject,
+        },
+      }),
+    );
+  }
+
+  if (url.pathname === "/ws/recording" && request.method === "GET") {
+    assertSameOrigin(request);
+    const principal = await authenticateWebSocket(request, env);
+    const room = validRoom(url.searchParams.get("room"));
+    await checkRoomPassword(
+      env,
+      room,
+      url.searchParams.get("password"),
+      false,
+    );
+    await authorizeRoom(env, room, principal.subject, "member");
+    return recordingBinding().fetch(
+      new Request("https://recording.internal/socket", {
+        headers: { upgrade: "websocket", "x-room-id": room },
+      }),
+    );
+  }
+
+  if (url.pathname === "/api/recording/pcm" && request.method === "GET") {
+    const room = validRoom(url.searchParams.get("room"));
+    return recordingBinding().fetch(
+      new Request(
+        `https://recording.internal/pcm?sessionId=${encodeURIComponent(url.searchParams.get("sessionId") ?? "")}&trackName=${encodeURIComponent(url.searchParams.get("trackName") ?? "")}`,
+        request,
+      ),
+    );
+  }
+
+  if (url.pathname === "/api/recording/status" && request.method === "GET") {
+    const room = validRoom(url.searchParams.get("room"));
+    await authorizeRecordingAccess(request, env, room, url);
+    return recordingBinding().fetch("https://recording.internal/status");
+  }
+
+  if (
+    url.pathname === "/api/recording/finalize" &&
+    request.method === "POST"
+  ) {
+    assertSameOrigin(request);
+    const room = validRoom(url.searchParams.get("room"));
+    const principal = await authenticateApplicationRequest(request, env);
+    await checkRoomPassword(env, room, request.headers.get("x-room-password"), false);
+    await authorizeRoom(env, room, principal.subject, "admin");
+    return recordingBinding().fetch(
+      new Request("https://recording.internal/finalize", { method: "POST" }),
+    );
+  }
+
+  if (url.pathname === "/recording" && request.method === "GET") {
+    const room = validRoom(url.searchParams.get("room"));
+    await authorizeRecordingAccess(request, env, room, url);
+    return recordingBinding().fetch("https://recording.internal/download/audio");
+  }
+  return undefined;
+}
+
+/** Password is enough after leave; guest ACL is only for passwordless rooms. */
+async function authorizeRecordingAccess(
+  request: Request,
+  env: ExtendedWorkerEnv,
+  room: string,
+  url: URL,
+): Promise<void> {
+  const password =
+    request.headers.get("x-room-password") ?? url.searchParams.get("password");
+  if (env.ROOM_PASSWORD_REQUIRED === "true") {
+    await checkRoomPassword(env, room, password, false);
+    return;
+  }
+  const principal = await authenticateApplicationRequest(request, env);
+  await authorizeRoom(env, room, principal.subject, "download");
+}
+
+async function authenticateWebSocket(
+  request: Request,
+  env: ExtendedWorkerEnv,
+): Promise<AuthenticatedPrincipal> {
+  const url = new URL(request.url);
+  if (env.AUTH_MODE === "skip") {
+    return guestPrincipal(url.searchParams.get("guest"));
+  }
+  const identity = url.searchParams.get("identity");
+  if (
+    env.AUTH_MODE === "local" &&
+    (url.hostname === "localhost" ||
+      url.hostname === "127.0.0.1" ||
+      url.hostname === "[::1]") &&
+    identity
+  ) {
+    const headers = new Headers(request.headers);
+    headers.set("x-video-room-local-identity", identity);
+    return authenticateApplicationRequest(new Request(request, { headers }), env);
+  }
+  return authenticateApplicationRequest(request, env);
+}
+
+function authenticateApplicationRequest(
+  request: Request,
+  env: ExtendedWorkerEnv,
+): Promise<AuthenticatedPrincipal> {
+  if (env.AUTH_MODE !== "skip") return authenticateRequest(request, env);
+  return Promise.resolve(guestPrincipal(request.headers.get("x-room-guest-id")));
+}
+
+function guestPrincipal(value: string | null): AuthenticatedPrincipal {
+  if (!value || !/^[0-9a-f-]{36}$/i.test(value)) {
+    throw new RequestError(
+      401,
+      "guest_identity_required",
+      "Refresh the page and enter the room password to join.",
+    );
+  }
+  return { displayHint: "Guest", subject: `guest:${value.toLowerCase()}` };
+}
+
+async function authorizeRoom(
+  env: ExtendedWorkerEnv,
+  room: string,
+  subject: string,
+  role: "admin" | "member" | "download",
+): Promise<void> {
+  if (!env.ROOM_DO) {
+    throw new RequestError(503, "room_binding_missing", "Room services are not configured.");
+  }
+  const response = await env.ROOM_DO.getByName(room).fetch(
+    new Request(`https://room.internal/authorize-${role}`, {
+      method: "POST",
+      headers: { "x-room-subject": subject },
+    }),
+  );
+  if (!response.ok) {
+    throw new RequestError(
+      response.status,
+      "room_authorization_failed",
+      role === "admin"
+        ? "Room admin permission is required."
+        : role === "download"
+          ? "Only a previous room participant can download these files."
+          : "Join the room first.",
+    );
+  }
+}
+
+function validRoom(value: string | null): string {
+  const parsed = roomIdSchema.safeParse(value);
+  if (!parsed.success) {
+    throw new RequestError(400, "room_id_invalid", "Room names use lowercase letters, numbers, and hyphens.");
+  }
+  return parsed.data;
+}
+
+async function checkRoomPassword(
+  env: ExtendedWorkerEnv,
+  roomId: string,
+  password: string | null | undefined,
+  create: boolean,
+): Promise<void> {
+  if (env.ROOM_PASSWORD_REQUIRED !== "true") return;
+  if (!env.ROOM_DO) {
+    throw new RequestError(503, "room_password_unavailable", "Room password protection is not configured.");
+  }
+  const response = await env.ROOM_DO.getByName(roomId).fetch(
+    "https://room.internal/password",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: password ?? "", create }),
+    },
+  );
+  if (response.ok) return;
+  if (response.status === 409) {
+    throw new RequestError(409, "room_password_not_initialized", "This room has not been created yet. Create it first.");
+  }
+  if (response.status === 400) {
+    throw new RequestError(400, "room_password_invalid", "Room password must be between 8 and 128 characters.");
+  }
+  throw new RequestError(401, "room_password_incorrect", "The room password is incorrect.");
+}
 
 function jsonRequest<S extends z.ZodType<Record<string, unknown>>>(
   schema: S,

@@ -33,9 +33,12 @@ import {
   type PersistedRoom,
 } from "./room";
 import { errorResponse, expectedRoomError } from "./http";
+import type { RecordingDO } from "../RecordingDO";
 
 type Env = RealtimeEnv & {
+  RECORDING_DO?: DurableObjectNamespace<RecordingDO>;
   ROOM_STALE_SECONDS?: string;
+  WORKER_HOSTNAME?: string;
 };
 
 export type RoomRpcContext = {
@@ -126,9 +129,15 @@ export class VideoRoom extends DurableObject<Env> {
     context: RoomRpcContext,
     input: PublishRequest,
   ): Promise<RoomRpcResult<PublishResponse>> {
-    return this.#runRpc(context, (coordinator) =>
-      coordinator.publish(context.principal, context.memberToken, input),
-    );
+    return this.#runRpc(context, async (coordinator) => {
+      const value = await coordinator.publish(
+        context.principal,
+        context.memberToken,
+        input,
+      );
+      await this.#syncRecordingTracks();
+      return value;
+    });
   }
 
   subscribe(
@@ -155,15 +164,25 @@ export class VideoRoom extends DurableObject<Env> {
   }
 
   leave(context: RoomRpcContext): Promise<RoomRpcResult<RoomSnapshot>> {
-    return this.#runRpc(context, (coordinator) =>
-      coordinator.leave(context.principal, context.memberToken),
-    );
+    return this.#runRpc(context, async (coordinator) => {
+      const value = await coordinator.leave(
+        context.principal,
+        context.memberToken,
+      );
+      await this.#syncRecordingTracks();
+      return value;
+    });
   }
 
   terminate(context: RoomRpcContext): Promise<RoomRpcResult<RoomSnapshot>> {
-    return this.#runRpc(context, (coordinator) =>
-      coordinator.terminate(context.principal, context.memberToken),
-    );
+    return this.#runRpc(context, async (coordinator) => {
+      const value = await coordinator.terminate(
+        context.principal,
+        context.memberToken,
+      );
+      await this.#syncRecordingTracks();
+      return value;
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -198,6 +217,7 @@ export class VideoRoom extends DurableObject<Env> {
     let cleared = false;
     try {
       const lease = await coordinator.expireStale();
+      await this.#syncRecordingTracks();
       if (lease) {
         cleared = await coordinator.deleteWithLease(lease, () =>
           this.ctx.storage.deleteAll(),
@@ -303,6 +323,31 @@ export class VideoRoom extends DurableObject<Env> {
         Date.now() + minimumDelayMs,
       ),
     );
+  }
+
+  async #syncRecordingTracks(): Promise<void> {
+    if (!this.env.RECORDING_DO || !this.room) return;
+    const tracks = Object.values(this.room.participants)
+      .filter((participant) => participant.status === "active")
+      .flatMap((participant) =>
+        participant.published
+          .filter((track) => track.kind === "audio")
+          .map((track) => ({
+            sessionId: track.producerSessionId,
+            trackName: track.trackName,
+          })),
+      );
+    try {
+      await this.env.RECORDING_DO.getByName(this.roomId).fetch(
+        new Request("https://recording.internal/sync-tracks", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ roomId: this.roomId, tracks }),
+        }),
+      );
+    } catch (error) {
+      console.error("recording sync failed", error);
+    }
   }
 
   async #runRpc<T>(

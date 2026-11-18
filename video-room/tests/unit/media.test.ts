@@ -76,6 +76,7 @@ function installPeerConnections(context: TestContext): void {
 class FakePeerConnection extends EventTarget {
   static instances: FakePeerConnection[] = [];
   connectionState: RTCPeerConnectionState = "new";
+  iceGatheringState: RTCIceGatheringState = "new";
   signalingState: RTCSignalingState = "stable";
   localDescription?: RTCSessionDescriptionInit;
   remoteDescription?: RTCSessionDescriptionInit;
@@ -102,24 +103,33 @@ class FakePeerConnection extends EventTarget {
     return { sdp: "publisher-offer", type: "offer" };
   }
 
+  async createAnswer(): Promise<RTCSessionDescriptionInit> {
+    return { sdp: "subscriber-answer", type: "answer" };
+  }
+
   async setLocalDescription(value: RTCSessionDescriptionInit): Promise<void> {
     this.localDescription = value;
     this.signalingState =
       value.type === "offer" ? "have-local-offer" : "stable";
+    this.iceGatheringState = "complete";
     this.dispatchEvent(new Event("signalingstatechange"));
+    this.dispatchEvent(new Event("icegatheringstatechange"));
   }
 
   async setRemoteDescription(value: RTCSessionDescriptionInit): Promise<void> {
     this.remoteDescription = value;
     this.signalingState =
       value.type === "offer" ? "have-remote-offer" : "stable";
+    this.connectionState = "connected";
     this.dispatchEvent(new Event("signalingstatechange"));
+    this.dispatchEvent(new Event("connectionstatechange"));
   }
 
   close(): void {
     this.connectionState = "closed";
     this.signalingState = "closed";
     this.dispatchEvent(new Event("signalingstatechange"));
+    this.dispatchEvent(new Event("connectionstatechange"));
   }
 }
 

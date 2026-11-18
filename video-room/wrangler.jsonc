@@ -1,18 +1,36 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "realtime-video-room-blueprint",
+  "name": "voice-room-sfu",
   "main": "src/worker.ts",
   "compatibility_date": "2026-08-27",
   "assets": {
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"]
+    "run_worker_first": ["/api/*", "/ws/*", "/recording"]
+  },
+  "r2_buckets": [
+    {
+      "binding": "RECORDINGS",
+      "bucket_name": "my-bucket"
+    }
+  ],
+  "ai": {
+    "binding": "AI",
+    "remote": true
   },
   "durable_objects": {
     "bindings": [
       {
         "name": "ROOMS",
         "class_name": "VideoRoom"
+      },
+      {
+        "name": "ROOM_DO",
+        "class_name": "RoomDO"
+      },
+      {
+        "name": "RECORDING_DO",
+        "class_name": "RecordingDO"
       }
     ]
   },
@@ -20,10 +38,16 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["VideoRoom"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["RoomDO", "RecordingDO"]
     }
   ],
   "vars": {
-    "AUTH_MODE": "cloudflare-access",
-    "ROOM_STALE_SECONDS": "45"
+    "AUTH_MODE": "skip",
+    "ROOM_PASSWORD_REQUIRED": "true",
+    "ROOM_STALE_SECONDS": "45",
+    "WORKER_HOSTNAME": "voice-room-sfu.madhan1975.workers.dev"
   }
 }

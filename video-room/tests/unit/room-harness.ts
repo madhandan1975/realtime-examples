@@ -95,6 +95,21 @@ export class FakeSfu implements SfuClient {
     this.renegotiated.push(sessionId);
     this.events.push(`renegotiate-settled:${sessionId}`);
   }
+
+  async pullTrackToWebSocket(
+    sessionId: string,
+    trackName: string,
+  ): Promise<{ adapterId?: string }> {
+    this.events.push(`adapter-pull:${sessionId}:${trackName}`);
+    return { adapterId: `adapter-${sessionId}-${trackName}` };
+  }
+
+  async closeWebSocketAdapter(
+    adapterId: string,
+  ): Promise<{ alreadyClosed: boolean; ok: boolean }> {
+    this.events.push(`adapter-close:${adapterId}`);
+    return { alreadyClosed: false, ok: true };
+  }
 }
 
 export function harness(

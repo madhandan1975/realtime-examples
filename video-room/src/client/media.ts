@@ -78,8 +78,9 @@ export class MediaSessions {
         );
         const offer = await this.producer.createOffer();
         await this.producer.setLocalDescription(offer);
+        await waitForIceGathering(this.producer);
         prepared = {
-          offer: description(offer, "offer"),
+          offer: description(this.producer.localDescription!, "offer"),
           tracks: transceivers.map((transceiver) => ({
             kind: transceiver.sender.track!.kind as "audio" | "video",
             mid: requiredMid(transceiver),
@@ -95,6 +96,7 @@ export class MediaSessions {
       if (!this.producer.remoteDescription) {
         await this.producer.setRemoteDescription(response.sessionDescription);
       }
+      await waitForConnected(this.producer);
     });
   }
 
@@ -111,6 +113,10 @@ export class MediaSessions {
     let answer: SessionDescription | undefined;
     await this.consumerQueue.enqueue(async () => {
       await waitForStable(this.consumer);
+      // SFU rejects tracks/new when the consumer session is already down.
+      if (this.consumer.remoteDescription) {
+        await waitForConnected(this.consumer);
+      }
       response ??= await this.api.subscribe(
         this.generation,
         mutation,
@@ -130,7 +136,8 @@ export class MediaSessions {
         await this.consumer.setRemoteDescription(response.sessionDescription);
         const localAnswer = await this.consumer.createAnswer();
         await this.consumer.setLocalDescription(localAnswer);
-        answer = description(localAnswer, "answer");
+        await waitForIceGathering(this.consumer);
+        answer = description(this.consumer.localDescription!, "answer");
       }
       await this.api.renegotiate(
         this.generation,
@@ -138,6 +145,7 @@ export class MediaSessions {
         answer,
         this.abortController.signal,
       );
+      await waitForConnected(this.consumer);
     });
   }
 
@@ -214,6 +222,71 @@ async function waitForStable(peer: RTCPeerConnection): Promise<void> {
       resolve();
     };
     peer.addEventListener("signalingstatechange", changed);
+  });
+}
+
+/** SFU uses non-trickle SDP; wait until candidates are in localDescription. */
+async function waitForIceGathering(peer: RTCPeerConnection): Promise<void> {
+  if (peer.iceGatheringState === "complete") return;
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      peer.removeEventListener("icegatheringstatechange", changed);
+      resolve();
+    }, 5_000);
+    const changed = () => {
+      if (peer.iceGatheringState !== "complete") return;
+      clearTimeout(timeout);
+      peer.removeEventListener("icegatheringstatechange", changed);
+      resolve();
+    };
+    peer.addEventListener("icegatheringstatechange", changed);
+  });
+}
+
+async function waitForConnected(peer: RTCPeerConnection): Promise<void> {
+  if (peer.connectionState === "connected") return;
+  if (
+    peer.connectionState === "failed" ||
+    peer.connectionState === "closed"
+  ) {
+    throw new ApiError(
+      "peer_connection_failed",
+      "PeerConnection is not connected.",
+      true,
+    );
+  }
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      peer.removeEventListener("connectionstatechange", changed);
+      reject(
+        new ApiError(
+          "peer_connection_timeout",
+          "PeerConnection did not become connected.",
+          true,
+        ),
+      );
+    }, 15_000);
+    const changed = () => {
+      const state = peer.connectionState;
+      if (state === "connected") {
+        clearTimeout(timeout);
+        peer.removeEventListener("connectionstatechange", changed);
+        resolve();
+        return;
+      }
+      if (state === "failed" || state === "closed") {
+        clearTimeout(timeout);
+        peer.removeEventListener("connectionstatechange", changed);
+        reject(
+          new ApiError(
+            "peer_connection_failed",
+            "PeerConnection is not connected.",
+            true,
+          ),
+        );
+      }
+    };
+    peer.addEventListener("connectionstatechange", changed);
   });
 }
 

@@ -46,7 +46,16 @@ export interface SfuClient {
     sessionId: string,
     mids: string[],
   ): Promise<SfuResponse>;
+  closeWebSocketAdapter(
+    adapterId: string,
+  ): Promise<{ alreadyClosed: boolean; ok: boolean }>;
   createSession(): Promise<string>;
+  pullTrackToWebSocket(
+    sessionId: string,
+    trackName: string,
+    endpoint: string,
+    opts?: { outputCodec?: "pcm" },
+  ): Promise<{ adapterId?: string; error?: string }>;
   renegotiate(
     sessionId: string,
     answer: SessionDescription,
@@ -107,11 +116,25 @@ export function sfuResponseError(
   message: string,
   status = 502,
 ): SfuRequestError {
+  const code = sanitizeErrorIdentifier(value.errorCode) ?? "sfu_upstream_error";
+  const detail =
+    typeof value.errorDescription === "string" && value.errorDescription.trim()
+      ? value.errorDescription.trim()
+      : typeof value.errorCode === "string" && value.errorCode.trim()
+        ? value.errorCode.trim()
+        : undefined;
+  // Dead SFU sessions need a fresh PeerConnection (retryable reconnect), not a
+  // blind tracks/new retry. Keep other provider wording server-side only.
+  const needsNewSession =
+    typeof detail === "string" &&
+    /disconnected|peerconnection/i.test(detail);
   return new SfuRequestError(
-    sanitizeErrorIdentifier(value.errorCode) ?? "sfu_upstream_error",
-    message,
+    code,
+    needsNewSession
+      ? `${message} (Session appears to be disconnected. Please check if the PeerConnection is connected.)`
+      : message,
     status,
-    undefined,
+    needsNewSession ? true : undefined,
     trackLocator(value),
   );
 }
@@ -207,6 +230,91 @@ export class RealtimeSfuClient implements SfuClient {
     assertSfuResponse(response);
   }
 
+  async pullTrackToWebSocket(
+    sessionId: string,
+    trackName: string,
+    endpoint: string,
+    opts?: { outputCodec?: "pcm" },
+  ): Promise<{ adapterId?: string; error?: string }> {
+    const response = await this.request("/adapters/websocket/new", "POST", {
+      tracks: [
+        {
+          endpoint,
+          location: "remote",
+          outputCodec: opts?.outputCodec ?? "pcm",
+          sessionId,
+          trackName,
+        },
+      ],
+    });
+    const tracks = Array.isArray(response.tracks) ? response.tracks : [];
+    const first = tracks[0];
+    if (!first || typeof first !== "object") {
+      return { error: "SFU adapter response did not include a track result." };
+    }
+    const row = first as {
+      adapterId?: unknown;
+      errorCode?: unknown;
+      errorDescription?: unknown;
+    };
+    if (typeof row.adapterId === "string" && row.adapterId) {
+      return { adapterId: row.adapterId };
+    }
+    const detail =
+      typeof row.errorDescription === "string" && row.errorDescription.trim()
+        ? row.errorDescription.trim()
+        : typeof row.errorCode === "string" && row.errorCode.trim()
+          ? row.errorCode.trim()
+          : "missing adapterId";
+    return { error: `SFU adapter create failed (${detail}).` };
+  }
+
+  async closeWebSocketAdapter(
+    adapterId: string,
+  ): Promise<{ alreadyClosed: boolean; ok: boolean }> {
+    let response: globalThis.Response;
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      this.requestTimeoutMs,
+    );
+    try {
+      response = await this.fetcher(`${this.baseUrl}/adapters/websocket/close`, {
+        body: JSON.stringify({ tracks: [{ adapterId }] }),
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "content-type": "application/json",
+        },
+        method: "POST",
+        signal: controller.signal,
+      });
+    } catch {
+      throw new SfuRequestError(
+        controller.signal.aborted ? "sfu_request_timed_out" : "sfu_unreachable",
+        controller.signal.aborted
+          ? "Realtime SFU did not respond before the request timeout."
+          : "Realtime SFU could not be reached. Retry the operation.",
+        controller.signal.aborted ? 504 : 503,
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (response.ok) return { alreadyClosed: false, ok: true };
+    const text = await response.text();
+    let alreadyClosed = false;
+    if (response.status === 503) {
+      try {
+        const payload = JSON.parse(text) as {
+          tracks?: Array<{ errorCode?: string }>;
+        };
+        alreadyClosed = payload.tracks?.[0]?.errorCode === "adapter_not_found";
+      } catch {
+        alreadyClosed = false;
+      }
+    }
+    return { alreadyClosed, ok: alreadyClosed };
+  }
+
   private async request(
     path: string,
     method: "POST" | "PUT",
@@ -248,8 +356,39 @@ export class RealtimeSfuClient implements SfuClient {
     const payload = await responseObject(response);
     const responseStatus = normalizeStatus(response.status, 502);
     if (!response.ok) {
+      console.error("Realtime SFU HTTP error", {
+        path,
+        status: responseStatus,
+        errorCode:
+          payload && typeof payload.errorCode === "string"
+            ? payload.errorCode
+            : undefined,
+        errorDescription:
+          payload && typeof payload.errorDescription === "string"
+            ? payload.errorDescription
+            : undefined,
+        trackError:
+          payload &&
+          Array.isArray(payload.tracks) &&
+          payload.tracks[0] &&
+          typeof payload.tracks[0] === "object"
+            ? payload.tracks[0]
+            : undefined,
+      });
+      const track =
+        payload &&
+        Array.isArray(payload.tracks) &&
+        payload.tracks[0] &&
+        typeof payload.tracks[0] === "object"
+          ? (payload.tracks[0] as {
+              errorCode?: unknown;
+              errorDescription?: unknown;
+              mid?: unknown;
+              trackName?: unknown;
+            })
+          : undefined;
       throw sfuResponseError(
-        payload ?? {},
+        track ?? payload ?? {},
         isRetryableSfuStatus(responseStatus)
           ? "Realtime SFU could not complete the operation."
           : "Realtime SFU rejected the operation.",
