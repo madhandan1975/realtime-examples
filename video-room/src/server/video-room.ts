@@ -188,17 +188,18 @@ export class VideoRoom extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const requestId = request.headers.get("x-request-id") ?? crypto.randomUUID();
     try {
-      if (
-        request.method !== "GET" ||
-        new URL(request.url).pathname !== "/socket"
-      ) {
+      const url = new URL(request.url);
+      await this.ready;
+      if (url.pathname === "/purge" && request.method === "POST") {
+        return await this.#purge();
+      }
+      if (request.method !== "GET" || url.pathname !== "/socket") {
         throw new RequestError(
           404,
           "route_not_found",
           "The room operation does not exist.",
         );
       }
-      await this.ready;
       return await this.#acceptNotificationSocket(
         request,
         this.#getCoordinator(),
@@ -206,6 +207,20 @@ export class VideoRoom extends DurableObject<Env> {
     } catch (error) {
       return errorResponse(error, requestId);
     }
+  }
+
+  async #purge(): Promise<Response> {
+    for (const socket of [...this.ctx.getWebSockets()]) {
+      try {
+        socket.close(4003, "Room purged.");
+      } catch {
+        // Best-effort.
+      }
+    }
+    await this.ctx.storage.deleteAll();
+    this.room = emptyRoom(this.roomId);
+    this.coordinator = undefined;
+    return Response.json({ ok: true });
   }
 
   async alarm(): Promise<void> {

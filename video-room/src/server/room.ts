@@ -117,22 +117,46 @@ export class RoomCoordinator {
       `join:${principal.subject}:${clientId}:${memberTokenHash}`,
       async () => {
         this.assertRoomOpen();
-        const duplicate = Object.values(this.room.participants).find(
+        // Same guest/subject already in the room (lost local token, refresh, or
+        // Join after a failed leave) — take over the seat instead of 409 looping.
+        const existing = Object.values(this.room.participants).find(
           (participant) =>
             participant.subject === principal.subject &&
-            participant.clientId === clientId &&
             participant.status === "active",
         );
-        if (duplicate) {
-          if (duplicate.tokenHash === memberTokenHash) {
-            return this.joinResponse(duplicate, memberToken);
+        if (existing) {
+          if (
+            existing.tokenHash === memberTokenHash &&
+            existing.clientId === clientId
+          ) {
+            existing.displayName = displayName;
+            existing.lastSeenAt = this.now();
+            await this.changed();
+            return this.joinResponse(existing, memberToken);
           }
-          throw new RequestError(
-            409,
-            "resume_required",
-            "This browser is already joined. Reconnect with its member token.",
-            true,
-          );
+          await this.media.forceCleanup(existing);
+          const generation =
+            Math.max(
+              existing.producer.generation,
+              existing.consumer.generation,
+            ) + 1;
+          const [producerId, consumerId] = await Promise.all([
+            this.sfu.createSession(),
+            this.sfu.createSession(),
+          ]);
+          this.assertRoomOpen();
+          existing.clientId = clientId;
+          existing.consumer = sessionState(consumerId, generation);
+          existing.producer = sessionState(producerId, generation);
+          existing.completedReconnectRequestIds = [];
+          existing.displayName = displayName;
+          existing.lastSeenAt = this.now();
+          existing.lifecycleVersion += 1;
+          existing.published = [];
+          existing.subscriptions = [];
+          existing.tokenHash = memberTokenHash;
+          await this.changed();
+          return this.joinResponse(existing, memberToken);
         }
 
         const [producerId, consumerId] = await Promise.all([

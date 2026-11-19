@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { RoomApi } from "./api";
 import { lifecycleControlState } from "./lifecycle";
 import { openAnotherParticipant } from "./open-participant";
 import type {
@@ -6,15 +7,28 @@ import type {
   RoomController,
   RoomViewState,
 } from "./room-controller";
+import {
+  consumeRoomInviteFromLocation,
+  createSecretStorageKey,
+  guestIdentity,
+  passwordStorageKey,
+} from "./ws-bootstrap";
 
 enforceVoiceOnlyCapture();
-cacheRoomPasswordFromUrl();
-installRoomPasswordPropagation();
+const invitePasswordFromUrl = consumeRoomInviteFromLocation();
 
 export function App({ controller }: { controller: RoomController }) {
   const [password, setPassword] = useState(
-    () => sessionStorage.getItem(passwordStorageKey(controller.roomId)) ?? "",
+    () =>
+      invitePasswordFromUrl ??
+      sessionStorage.getItem(passwordStorageKey(controller.roomId)) ??
+      "",
   );
+  const [createSecret, setCreateSecret] = useState(
+    () =>
+      sessionStorage.getItem(createSecretStorageKey(controller.roomId)) ?? "",
+  );
+  const [lobbyMode, setLobbyMode] = useState<"join" | "create">("join");
   const state = useSyncExternalStore(
     controller.subscribe,
     controller.getSnapshot,
@@ -47,6 +61,7 @@ export function App({ controller }: { controller: RoomController }) {
               busy={controls.roomBusy}
               leaveDisabled={controls.leaveDisabled}
               onLeave={controller.leave}
+              onSetMicMuted={controller.setMicMuted}
             />
           ) : (
             <Lobby
@@ -56,14 +71,34 @@ export function App({ controller }: { controller: RoomController }) {
               nameDisabled={controls.displayNameDisabled}
               joinDisabled={controls.joinDisabled}
               password={password}
+              createSecret={createSecret}
+              mode={lobbyMode}
+              onModeChange={setLobbyMode}
               onPasswordChange={setPassword}
+              onCreateSecretChange={setCreateSecret}
               onNameChange={controller.setDisplayName}
-              onJoin={() => {
+              onJoin={async () => {
                 sessionStorage.setItem(
                   passwordStorageKey(controller.roomId),
                   password,
                 );
-                return controller.join();
+                if (lobbyMode === "create") {
+                  // Fresh room claim — drop old membership so Create owns host.
+                  sessionStorage.removeItem("video-room-joined");
+                  sessionStorage.removeItem("video-room-token");
+                  sessionStorage.removeItem("video-room-pending-token");
+                  sessionStorage.setItem(
+                    createSecretStorageKey(controller.roomId),
+                    createSecret,
+                  );
+                  await new RoomApi(
+                    controller.roomId,
+                    guestIdentity(controller.roomId),
+                  ).create();
+                }
+                // Keep member token on Join so resume works; server also
+                // takes over if the token was lost but this guest is still active.
+                await controller.join();
               }}
             />
           )}
@@ -142,7 +177,7 @@ function RoomHeader({
             <rect x="8" y="8" width="12" height="12" rx="2" />
             <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
           </svg>
-          Copy link
+          Copy invite link
         </button>
         <button
           id="open-participant"
@@ -161,23 +196,44 @@ function Lobby({
   roomId,
   displayName,
   password,
+  createSecret,
+  mode,
   busy,
   nameDisabled,
   joinDisabled,
+  onModeChange,
   onNameChange,
   onPasswordChange,
+  onCreateSecretChange,
   onJoin,
 }: {
   roomId: string;
   displayName: string;
   password: string;
+  createSecret: string;
+  mode: "join" | "create";
   busy: boolean;
   nameDisabled: boolean;
   joinDisabled: boolean;
+  onModeChange: (mode: "join" | "create") => void;
   onNameChange: (name: string) => void;
   onPasswordChange: (password: string) => void;
+  onCreateSecretChange: (secret: string) => void;
   onJoin: () => Promise<void>;
 }) {
+  const creating = mode === "create";
+  const passwordUnlocked = !creating && password.length >= 8;
+  const [lobbyError, setLobbyError] = useState("");
+  const submit = async () => {
+    setLobbyError("");
+    try {
+      await onJoin();
+    } catch (error) {
+      setLobbyError(
+        error instanceof Error ? error.message : "Could not join the room.",
+      );
+    }
+  };
   return (
     <section
       id="lobby"
@@ -190,84 +246,157 @@ function Lobby({
           id="lobby-title"
           className="text-2xl leading-tight font-semibold tracking-tight sm:text-3xl"
         >
-          Join{" "}
+          {creating ? "Create" : "Join"}{" "}
           <span id="lobby-room-id" className="wrap-anywhere">
             {roomId}
           </span>
         </h1>
         <p className="mt-3 text-sm leading-6 text-stone-600 sm:text-base">
-          Enter your name, then allow microphone access. This room is audio
-          only. The room creator's browser automatically records and transcribes
-          the mixed room audio.
+          {creating
+            ? "Set a room password and your host create key. Guests join with the invite link."
+            : passwordUnlocked
+              ? "Invite unlocked — enter your name to join. This room is audio only."
+              : "Enter your name and the room password, or open an invite link. This room is audio only."}
         </p>
+
+        <div
+          className="mt-6 inline-flex rounded-lg border border-stone-300 p-1"
+          role="group"
+          aria-label="Lobby mode"
+        >
+          <button
+            type="button"
+            className={`rounded-md px-3 py-1.5 text-sm font-medium ${
+              !creating
+                ? "bg-stone-900 text-white"
+                : "text-stone-700 hover:bg-stone-100"
+            }`}
+            aria-pressed={!creating}
+            onClick={() => onModeChange("join")}
+          >
+            Join
+          </button>
+          <button
+            type="button"
+            className={`rounded-md px-3 py-1.5 text-sm font-medium ${
+              creating
+                ? "bg-stone-900 text-white"
+                : "text-stone-700 hover:bg-stone-100"
+            }`}
+            aria-pressed={creating}
+            onClick={() => onModeChange("create")}
+          >
+            Create room
+          </button>
+        </div>
 
         <form
           id="join-form"
-          className="mt-8"
+          className="mt-8 space-y-3"
           aria-busy={busy}
           onSubmit={(event) => {
             event.preventDefault();
-            void onJoin();
+            void submit();
           }}
         >
           <label htmlFor="display-name" className="block text-sm font-medium">
             Display name
           </label>
-          <div className="mt-2 flex flex-col gap-3 sm:flex-row">
-            <input
-              id="display-name"
-              value={displayName}
-              onChange={(event) => onNameChange(event.currentTarget.value)}
-              disabled={nameDisabled}
-              className="min-h-12 w-full min-w-0 rounded-lg border border-stone-500 bg-white px-3.5 py-2.5 text-base shadow-xs placeholder:text-stone-500 enabled:hover:border-stone-600 disabled:cursor-not-allowed disabled:border-stone-300 disabled:bg-stone-100 disabled:text-stone-500"
-              name="display-name"
-              maxLength={48}
-              autoComplete="name"
-              placeholder="Your name"
-              required
-            />
-            <input
-              id="room-password"
-              value={password}
-              onChange={(event) => onPasswordChange(event.currentTarget.value)}
-              disabled={nameDisabled}
-              className="min-h-12 w-full min-w-0 rounded-lg border border-stone-500 bg-white px-3.5 py-2.5 text-base shadow-xs placeholder:text-stone-500 enabled:hover:border-stone-600 disabled:cursor-not-allowed disabled:border-stone-300 disabled:bg-stone-100 disabled:text-stone-500"
-              name="room-password"
-              type="password"
-              minLength={8}
-              maxLength={128}
-              autoComplete="current-password"
-              placeholder="Room password (8+ characters)"
-              required
-            />
-            <button
-              className="inline-flex min-h-12 cursor-pointer shrink-0 items-center justify-center gap-2 rounded-lg bg-orange-700 px-5 py-3 text-sm font-semibold text-white shadow-xs transition-colors enabled:hover:bg-orange-800 disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none"
-              type="submit"
-              disabled={joinDisabled}
+          <input
+            id="display-name"
+            value={displayName}
+            onChange={(event) => onNameChange(event.currentTarget.value)}
+            disabled={nameDisabled}
+            className="min-h-12 w-full min-w-0 rounded-lg border border-stone-500 bg-white px-3.5 py-2.5 text-base shadow-xs placeholder:text-stone-500 enabled:hover:border-stone-600 disabled:cursor-not-allowed disabled:border-stone-300 disabled:bg-stone-100 disabled:text-stone-500"
+            name="display-name"
+            maxLength={48}
+            autoComplete="name"
+            placeholder="Your name"
+            required
+          />
+          {passwordUnlocked ? (
+            <p
+              className="rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2.5 text-sm text-emerald-900"
+              role="status"
             >
-              Join room
-              <svg
-                className="size-4"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
+              Invite unlocked — room password applied from the link.
+            </p>
+          ) : (
+            <>
+              <label htmlFor="room-password" className="block text-sm font-medium">
+                Room password
+              </label>
+              <input
+                id="room-password"
+                value={password}
+                onChange={(event) => onPasswordChange(event.currentTarget.value)}
+                disabled={nameDisabled}
+                className="min-h-12 w-full min-w-0 rounded-lg border border-stone-500 bg-white px-3.5 py-2.5 text-base shadow-xs placeholder:text-stone-500 enabled:hover:border-stone-600 disabled:cursor-not-allowed disabled:border-stone-300 disabled:bg-stone-100 disabled:text-stone-500"
+                name="room-password"
+                type="password"
+                minLength={8}
+                maxLength={128}
+                autoComplete={creating ? "new-password" : "current-password"}
+                placeholder="Room password (8+ characters)"
+                required
+              />
+            </>
+          )}
+          {creating && (
+            <>
+              <label
+                htmlFor="host-create-key"
+                className="block text-sm font-medium"
               >
-                <path d="M5 12h14m-5-5 5 5-5 5" />
-              </svg>
-            </button>
-          </div>
+                Host create key
+              </label>
+              <input
+                id="host-create-key"
+                value={createSecret}
+                onChange={(event) =>
+                  onCreateSecretChange(event.currentTarget.value)
+                }
+                disabled={nameDisabled}
+                className="min-h-12 w-full min-w-0 rounded-lg border border-stone-500 bg-white px-3.5 py-2.5 text-base shadow-xs placeholder:text-stone-500 enabled:hover:border-stone-600 disabled:cursor-not-allowed disabled:border-stone-300 disabled:bg-stone-100 disabled:text-stone-500"
+                name="host-create-key"
+                type="password"
+                minLength={8}
+                maxLength={256}
+                autoComplete="off"
+                placeholder="Private host create key"
+                required
+              />
+            </>
+          )}
+          <button
+            className="inline-flex min-h-12 w-full cursor-pointer items-center justify-center gap-2 rounded-lg bg-orange-700 px-5 py-3 text-sm font-semibold text-white shadow-xs transition-colors enabled:hover:bg-orange-800 disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none sm:w-auto"
+            type="submit"
+            disabled={joinDisabled}
+          >
+            {creating ? "Create and join" : "Join room"}
+            <svg
+              className="size-4"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M5 12h14m-5-5 5 5-5 5" />
+            </svg>
+          </button>
+          {lobbyError && (
+            <p className="text-sm text-red-700" role="alert">
+              {lobbyError}
+            </p>
+          )}
         </form>
 
         <p className="mt-6 rounded-lg bg-stone-50 px-4 py-3 text-sm leading-6 text-stone-600">
-          Trying this on your own? Use{" "}
-          <strong className="font-medium text-stone-900">
-            Open another participant
-          </strong>{" "}
-          to create a fresh tab. Duplicating this tab can reuse your identity.
+          Use <strong className="font-medium text-stone-800">Copy invite link</strong>{" "}
+          so guests only enter a name. Only the host create key can open a new room.
         </p>
         <RoomDownloads roomId={roomId} />
         <p className="mt-4 text-center text-xs text-stone-500">
@@ -282,8 +411,10 @@ function Lobby({
 
 type RoomParticipant = {
   displayName: string;
+  forceMuted?: boolean;
   handRaised: boolean;
   id: string;
+  mediaParticipantId?: string | null;
   muted: boolean;
   role: "admin" | "participant";
   speaking: boolean;
@@ -293,13 +424,31 @@ type RecordingStatus = {
   adapters: number;
   bytesRecorded: number;
   chunkCount: number;
+  downloadFilename?: string | null;
   downloadable: boolean;
   elapsedMs: number;
   finalized: boolean;
+  format?: string | null;
   remainingMs: number;
+  startedAt?: number | null;
   status: string;
   tracks: number;
 };
+
+function recordingDownloadFilename(
+  meta: Pick<RecordingStatus, "downloadFilename" | "format" | "startedAt"> | null,
+): string {
+  if (meta?.downloadFilename) return meta.downloadFilename;
+  const ext = meta?.format === "ogg/opus" ? "ogg" : "wav";
+  if (meta?.startedAt) {
+    const date = new Date(meta.startedAt);
+    const y = date.getUTCFullYear();
+    const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(date.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${d}.${ext}`;
+  }
+  return `recording.${ext}`;
+}
 
 function Room({
   roomId,
@@ -309,6 +458,7 @@ function Room({
   busy,
   leaveDisabled,
   onLeave,
+  onSetMicMuted,
 }: {
   roomId: string;
   password: string;
@@ -317,28 +467,73 @@ function Room({
   busy: boolean;
   leaveDisabled: boolean;
   onLeave: () => Promise<void>;
+  onSetMicMuted: (muted: boolean) => void;
 }) {
   const [participants, setParticipants] = useState<RoomParticipant[]>([]);
   const [reactions, setReactions] = useState<Record<string, string>>({});
   const [selfId, setSelfId] = useState<string>();
   const [adminId, setAdminId] = useState<string>();
   const [muted, setMuted] = useState(false);
+  const [forceMuted, setForceMuted] = useState(false);
   const [handRaised, setHandRaised] = useState(false);
+  const [endingCall, setEndingCall] = useState(false);
   const [recordingStatus, setRecordingStatus] = useState("Connecting room controls…");
   const [recordingMeta, setRecordingMeta] = useState<RecordingStatus | null>(null);
   const mutedRef = useRef(muted);
+  const forceMutedRef = useRef(forceMuted);
+  const selfIdRef = useRef<string | undefined>(undefined);
+  const isAdminRef = useRef(false);
   const pushToTalkRef = useRef(false);
   const pushToTalkWasMutedRef = useRef(true);
   const socket = useRef<WebSocket | undefined>(undefined);
   const leavingRef = useRef(false);
+  const callEndedRef = useRef(false);
+  const endingCallRef = useRef(false);
+  const pendingMuteAllRef = useRef(false);
+  const hostActionStatusUntilRef = useRef(0);
   const selfName =
     room.snapshot.participants.find((item) => item.id === room.selfId)
       ?.displayName ?? displayName;
-  const isAdmin = Boolean(selfId && adminId === selfId);
+  // Host chrome: RoomDO admin, SFU creator, or this browser holds the create key.
+  const isRoomDoAdmin = Boolean(selfId && adminId && adminId === selfId);
+  const isVideoRoomCreator =
+    room.snapshot.creatorParticipantId !== null &&
+    room.snapshot.creatorParticipantId === room.selfId;
+  const isCreateKeyHolder = Boolean(
+    sessionStorage.getItem(createSecretStorageKey(roomId)),
+  );
+  const isAdmin = isRoomDoAdmin || isVideoRoomCreator || isCreateKeyHolder;
   mutedRef.current = muted;
+  forceMutedRef.current = forceMuted;
+  isAdminRef.current = isAdmin;
+  const applyMicMuted = (nextMuted: boolean) => {
+    // Keep mic tracks enabled — SFU GC's publications that go silent via enabled=false.
+    room.localStream.getAudioTracks().forEach((track) => {
+      track.enabled = true;
+    });
+    onSetMicMuted(nextMuted);
+    setMuted(nextMuted);
+    mutedRef.current = nextMuted;
+  };
+  const applyHostForceMute = (forced: boolean) => {
+    forceMutedRef.current = forced;
+    setForceMuted(forced);
+    if (forced) {
+      pushToTalkRef.current = false;
+      applyMicMuted(true);
+    } else {
+      // Silent-track unmute only — full media refresh races session generation.
+      applyMicMuted(false);
+    }
+  };
+  const setHostActionStatus = (text: string, holdMs = 15_000) => {
+    hostActionStatusUntilRef.current = Date.now() + holdMs;
+    setRecordingStatus(text);
+  };
   const leaveRoom = async () => {
     if (leavingRef.current) return;
     leavingRef.current = true;
+    callEndedRef.current = true;
     try {
       await onLeave();
     } finally {
@@ -347,6 +542,71 @@ function Room({
   };
   const leaveRoomRef = useRef(leaveRoom);
   leaveRoomRef.current = leaveRoom;
+
+  const endCall = async () => {
+    if (endingCall || leavingRef.current) return;
+    if (!isAdmin) {
+      setRecordingStatus("Only the room host can end the call.");
+      return;
+    }
+    if (!confirm("End the call for everyone and stop server recording?")) return;
+    setEndingCall(true);
+    endingCallRef.current = true;
+    setRecordingStatus("Ending call…");
+    if (socket.current?.readyState === WebSocket.OPEN) {
+      // Prefer RoomDO end-call (kicks everyone). Finalize runs on end-call / 4002.
+      socket.current.send(
+        JSON.stringify({ type: "end-call", claimHost: true }),
+      );
+      // If RoomDO never acks, don't leave the host stuck on "Ending…".
+      window.setTimeout(() => {
+        if (!endingCallRef.current || callEndedRef.current) return;
+        setRecordingStatus(
+          "Host controls did not confirm — ending this session and stopping recording…",
+        );
+        void finalizeThenLeaveRef.current();
+      }, 2_500);
+      return;
+    }
+    setRecordingStatus(
+      "Room controls offline — stopping recording and leaving…",
+    );
+    await finalizeThenLeaveRef.current();
+  };
+
+  const finalizeThenLeave = async () => {
+    const headers = new Headers();
+    addLocalIdentity(headers);
+    await fetch(
+      `/api/recording/finalize?room=${encodeURIComponent(roomId)}`,
+      { method: "POST", headers, credentials: "same-origin" },
+    ).catch(() => undefined);
+    await leaveRoomRef.current();
+    endingCallRef.current = false;
+    setEndingCall(false);
+  };
+  const finalizeThenLeaveRef = useRef(finalizeThenLeave);
+  finalizeThenLeaveRef.current = finalizeThenLeave;
+
+  useEffect(() => {
+    const onPageHide = () => {
+      // Stop RoomDO reconnect loops and drop control presence immediately.
+      callEndedRef.current = true;
+      const ws = socket.current;
+      socket.current = undefined;
+      try {
+        ws?.close(1000, "page-hide");
+      } catch {
+        // Page is unloading.
+      }
+    };
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("beforeunload", onPageHide);
+    return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("beforeunload", onPageHide);
+    };
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -370,7 +630,23 @@ function Room({
       control.onopen = () => {
         reconnectAttempt = 0;
         setRecordingStatus("Room controls connected.");
-        control.send(JSON.stringify({ type: "join", displayName: selfName }));
+        const claimHost =
+          (room.snapshot.creatorParticipantId !== null &&
+            room.snapshot.creatorParticipantId === room.selfId) ||
+          Boolean(sessionStorage.getItem(createSecretStorageKey(roomId)));
+        control.send(
+          JSON.stringify({
+            type: "join",
+            displayName: selfName,
+            claimHost,
+            mediaParticipantId: room.selfId,
+          }),
+        );
+        if (pendingMuteAllRef.current) {
+          pendingMuteAllRef.current = false;
+          control.send(JSON.stringify({ type: "mute-all", claimHost: true }));
+          setHostActionStatus("Mute all sent…");
+        }
         heartbeatTimer = window.setInterval(() => {
           if (control.readyState === WebSocket.OPEN) {
             control.send(JSON.stringify({ type: "ping" }));
@@ -378,6 +654,7 @@ function Room({
         }, 15_000);
       };
       control.onmessage = ({ data }) => {
+        if (control !== socket.current) return;
         let message: unknown;
         try {
           message = JSON.parse(String(data));
@@ -388,13 +665,46 @@ function Room({
         if (message.type === "room-state" && Array.isArray(message.participants)) {
           const next = message.participants.filter(isRoomParticipant);
           setParticipants(next);
-          setSelfId(typeof message.selfId === "string" ? message.selfId : undefined);
+          const nextSelfId =
+            typeof message.selfId === "string" ? message.selfId : undefined;
+          selfIdRef.current = nextSelfId;
+          setSelfId(nextSelfId);
           setAdminId(typeof message.adminId === "string" ? message.adminId : undefined);
           const self = next.find((item) => item.id === message.selfId);
           if (self) {
-            setMuted(self.muted);
+            const forced = Boolean(self.forceMuted);
+            forceMutedRef.current = forced;
+            setForceMuted(forced);
+            applyMicMuted(self.muted || forced);
             setHandRaised(self.handRaised);
           }
+        } else if (message.type === "mute-all") {
+          // Host must never apply force-mute to themselves (selfId can race).
+          if (
+            isAdminRef.current ||
+            (typeof message.by === "string" &&
+              message.by === selfIdRef.current)
+          ) {
+            if (
+              typeof message.by === "string" &&
+              message.by === selfIdRef.current
+            ) {
+              setHostActionStatus("Muted all participants.");
+            }
+            return;
+          }
+          applyHostForceMute(true);
+          setHostActionStatus("Muted by host.");
+        } else if (message.type === "unmute-all") {
+          if (
+            isAdminRef.current ||
+            (typeof message.by === "string" &&
+              message.by === selfIdRef.current)
+          ) {
+            return;
+          }
+          applyHostForceMute(false);
+          setHostActionStatus("Host unmuted everyone — you can speak.");
         } else if (message.type === "chime") {
           void playRoomChime(message.sound === "leave").catch((error: unknown) => {
             setRecordingStatus(error instanceof Error ? error.message : "Room chime failed.");
@@ -403,10 +713,31 @@ function Room({
           setParticipants((current) =>
             current.map((item) =>
               item.id === message.participantId && typeof message.muted === "boolean"
-                ? { ...item, muted: message.muted }
+                ? {
+                    ...item,
+                    muted: message.muted,
+                    forceMuted:
+                      typeof message.forceMuted === "boolean"
+                        ? message.forceMuted
+                        : item.forceMuted,
+                    speaking: message.muted ? false : item.speaking,
+                  }
                 : item,
             ),
           );
+          if (
+            typeof message.participantId === "string" &&
+            message.participantId === selfIdRef.current &&
+            typeof message.muted === "boolean"
+          ) {
+            const forced =
+              typeof message.forceMuted === "boolean"
+                ? message.forceMuted
+                : forceMutedRef.current && message.muted;
+            forceMutedRef.current = Boolean(forced);
+            setForceMuted(Boolean(forced));
+            applyMicMuted(message.muted || Boolean(forced));
+          }
         } else if (message.type === "hand") {
           setParticipants((current) =>
             current.map((item) =>
@@ -441,23 +772,90 @@ function Room({
           }, 4_000);
         } else if (message.type === "force-mute" || message.type === "force-unmute") {
           const nextMuted = message.type === "force-mute";
-          room.localStream.getAudioTracks().forEach((track) => {
-            track.enabled = !nextMuted;
-          });
-          setMuted(nextMuted);
+          applyHostForceMute(nextMuted);
+          if (!nextMuted) applyMicMuted(false);
+          setRecordingStatus(
+            nextMuted ? "Muted by host." : "Host unmuted you — you can speak.",
+          );
+        } else if (message.type === "mute-all-ok") {
+          const count =
+            typeof message.count === "number" ? message.count : undefined;
+          setHostActionStatus(
+            typeof count === "number"
+              ? `Muted ${count} participant${count === 1 ? "" : "s"}.`
+              : "Mute all applied.",
+          );
+        } else if (message.type === "unmute-all-ok") {
+          const count =
+            typeof message.count === "number" ? message.count : undefined;
+          setHostActionStatus(
+            typeof count === "number"
+              ? `Unmuted ${count} participant${count === 1 ? "" : "s"}.`
+              : "Unmute all applied.",
+          );
+        } else if (message.type === "transfer-admin-ok") {
+          setHostActionStatus("Host controls transferred.");
+        } else if (message.type === "error") {
+          const detail =
+            typeof message.message === "string"
+              ? message.message
+              : "Room control request failed.";
+          setHostActionStatus(detail);
+          if (endingCallRef.current) {
+            endingCallRef.current = false;
+            setEndingCall(false);
+          }
         } else if (message.type === "kicked" || message.type === "end-call") {
-          void leaveRoomRef.current();
+          callEndedRef.current = true;
+          if (message.type === "end-call") {
+            setRecordingStatus("Call ended. Finalizing recording…");
+            void finalizeThenLeaveRef.current();
+          } else {
+            void leaveRoomRef.current();
+          }
         }
       };
-      control.onerror = () => setRecordingStatus("Room controls disconnected. Reconnecting…");
-      control.onclose = () => {
+      control.onerror = () => {
+        if (!callEndedRef.current) {
+          setHostActionStatus(
+            "Room controls failed to connect. Hard-refresh, then Create the room again with the host key if you purged rooms.",
+            20_000,
+          );
+        }
+      };
+      control.onclose = (event) => {
         if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer);
         heartbeatTimer = undefined;
         if (socket.current === control) socket.current = undefined;
         if (disposed) return;
+        // Call ended / kicked: leave media and do not reconnect the control socket.
+        if (
+          callEndedRef.current ||
+          event.code === 4001 ||
+          event.code === 4002 ||
+          event.reason === "Call ended."
+        ) {
+          callEndedRef.current = true;
+          if (event.code === 4002 || event.reason === "Call ended.") {
+            void finalizeThenLeaveRef.current();
+          } else {
+            void leaveRoomRef.current();
+          }
+          return;
+        }
+        // Avoid infinite reconnect spam when the room was purged / not created.
+        if (reconnectAttempt >= 5) {
+          setHostActionStatus(
+            "Room controls keep failing. Leave, Create the room with the host key, then join again.",
+            30_000,
+          );
+          return;
+        }
         const delay = Math.min(30_000, 1_000 * 2 ** Math.min(reconnectAttempt, 4));
         reconnectAttempt += 1;
-        setRecordingStatus(`Room controls reconnecting in ${Math.round(delay / 1000)}s…`);
+        setRecordingStatus(
+          `Room controls reconnecting in ${Math.round(delay / 1000)}s…`,
+        );
         reconnectTimer = window.setTimeout(connect, delay);
       };
     };
@@ -466,15 +864,24 @@ function Room({
     return () => {
       disposed = true;
       clearTimers();
-      active?.close();
+      active?.close(1000, "room-controls-refresh");
       if (socket.current === active) socket.current = undefined;
     };
-  }, [roomId, password, room.selfId, selfName, room.localStream]);
+    // Reconnect when SFU creator identity settles so claimHost can be sent.
+  }, [
+    roomId,
+    password,
+    selfName,
+    room.selfId,
+    room.snapshot.creatorParticipantId,
+  ]);
 
   useEffect(() => {
     let disposed = false;
     const applyStatus = (status: RecordingStatus) => {
       setRecordingMeta(status);
+      // Keep Mute all / host action text visible; do not overwrite for 15s.
+      if (Date.now() < hostActionStatusUntilRef.current) return;
       if (status.status === "recording") {
         const minutes = Math.floor(status.elapsedMs / 60_000);
         const remaining = Math.ceil(status.remainingMs / 60_000);
@@ -519,8 +926,55 @@ function Room({
   const send = (message: Record<string, unknown>) => {
     if (socket.current?.readyState === WebSocket.OPEN) {
       socket.current.send(JSON.stringify(message));
+      return true;
     }
+    setHostActionStatus(
+      "Room controls not connected yet. Wait a moment and retry.",
+    );
+    return false;
   };
+
+  const lastMuteAllClickRef = useRef(0);
+  const muteAll = () => {
+    const now = Date.now();
+    if (now - lastMuteAllClickRef.current < 400) return;
+    lastMuteAllClickRef.current = now;
+    pendingMuteAllRef.current = true;
+    const open = socket.current?.readyState === WebSocket.OPEN;
+    if (!open) {
+      setHostActionStatus(
+        "Mute all queued — sending as soon as room controls connect…",
+      );
+      return;
+    }
+    pendingMuteAllRef.current = false;
+    const sent = send({ type: "mute-all", claimHost: true });
+    setHostActionStatus(
+      sent ? "Mute all sent…" : "Mute all failed to send — retry in a moment.",
+    );
+  };
+  const muteAllRef = useRef(muteAll);
+  muteAllRef.current = muteAll;
+
+  const unmuteAll = () => {
+    const sent = send({ type: "unmute-all", claimHost: true });
+    setHostActionStatus(
+      sent ? "Unmute all sent…" : "Unmute all failed — retry in a moment.",
+    );
+  };
+
+  // Native DOM listener — React root delegation alone shows “no listeners” on
+  // the button in DevTools; this binds a real click action on #mute-all.
+  useEffect(() => {
+    if (!isAdmin) return;
+    const button = document.getElementById("mute-all");
+    if (!button) return;
+    const onClick = () => {
+      muteAllRef.current();
+    };
+    button.addEventListener("click", onClick);
+    return () => button.removeEventListener("click", onClick);
+  }, [isAdmin, selfId, adminId]);
   useEffect(() => {
     const tracks = room.localStream.getAudioTracks();
     if (!tracks.length) return;
@@ -559,23 +1013,24 @@ function Room({
   useEffect(() => {
     const press = (event: KeyboardEvent) => {
       if (event.code !== "Space" || event.repeat || isTextInputTarget(event.target) || pushToTalkRef.current) return;
+      if (forceMutedRef.current) return;
       event.preventDefault();
       pushToTalkRef.current = true;
       pushToTalkWasMutedRef.current = mutedRef.current;
-      room.localStream.getAudioTracks().forEach((track) => {
-        track.enabled = true;
-      });
-      setMuted(false);
+      applyMicMuted(false);
       send({ type: "mute-status", muted: false });
     };
     const release = (event: KeyboardEvent) => {
       if (event.code !== "Space" || !pushToTalkRef.current) return;
       pushToTalkRef.current = false;
+      // Host may have force-muted during the hold — never unmute on release.
+      if (forceMutedRef.current) {
+        applyMicMuted(true);
+        send({ type: "mute-status", muted: true });
+        return;
+      }
       const restoreMuted = pushToTalkWasMutedRef.current;
-      room.localStream.getAudioTracks().forEach((track) => {
-        track.enabled = !restoreMuted;
-      });
-      setMuted(restoreMuted);
+      applyMicMuted(restoreMuted);
       send({ type: "mute-status", muted: restoreMuted });
     };
     window.addEventListener("keydown", press);
@@ -586,12 +1041,24 @@ function Room({
     };
   }, [room.localStream]);
 
+  // Re-apply mute after SFU media republish/reconnect.
+  useEffect(() => {
+    onSetMicMuted(muted || forceMuted);
+  }, [room.selfId, room.localStream, muted, forceMuted, onSetMicMuted]);
+
   const toggleMute = () => {
     const next = !muted;
-    room.localStream.getAudioTracks().forEach((track) => {
-      track.enabled = !next;
-    });
-    setMuted(next);
+    if (forceMutedRef.current && !next) {
+      if (isAdminRef.current) {
+        // Clear a stuck self force-mute (Mute all selfId race).
+        applyHostForceMute(false);
+        send({ type: "mute-status", muted: false });
+        return;
+      }
+      setRecordingStatus("Muted by host — wait for the host to unmute you.");
+      return;
+    }
+    applyMicMuted(next);
     send({ type: "mute-status", muted: next });
   };
   const toggleHand = () => {
@@ -619,8 +1086,9 @@ function Room({
     }
   };
 
-  const participantFor = (name: string) =>
-    participants.find((item) => item.displayName === name);
+  const controlForMediaId = (mediaId: string, displayName: string) =>
+    participants.find((item) => item.mediaParticipantId === mediaId) ??
+    participants.find((item) => item.displayName === displayName);
   return (
     <section
       id="room"
@@ -642,7 +1110,10 @@ function Room({
           aria-live="polite"
         >
           {room.snapshot.participants.map((participant) => {
-            const control = participantFor(participant.displayName);
+            const control = controlForMediaId(
+              participant.id,
+              participant.displayName,
+            );
             return (
               <ParticipantTile
                 key={participant.id}
@@ -654,8 +1125,12 @@ function Room({
                 reaction={control ? reactions[control.id] : undefined}
                 stream={participant.id === room.selfId ? room.localStream : room.remoteStreams.get(participant.id)}
                 admin={isAdmin && control?.id !== selfId ? control?.id : undefined}
-                onForceMute={(id) => send({ type: "force-mute", participantId: id })}
-                onForceUnmute={(id) => send({ type: "force-unmute", participantId: id })}
+                onForceMute={(id) =>
+                  send({ type: "force-mute", participantId: id, claimHost: true })
+                }
+                onForceUnmute={(id) =>
+                  send({ type: "force-unmute", participantId: id, claimHost: true })
+                }
                 onKick={(id) => send({ type: "kick", participantId: id })}
                 onTransfer={(id) => send({ type: "transfer-admin", participantId: id })}
                 speaking={control?.speaking ?? false}
@@ -665,8 +1140,8 @@ function Room({
         </div>
       </div>
       <div className="mt-4 flex flex-wrap items-center justify-end gap-2" role="group" aria-label="Room controls">
-        <button id="mute" onClick={toggleMute} className="inline-flex min-h-11 cursor-pointer items-center justify-center rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium" type="button" aria-pressed={muted}>
-          {muted ? "Unmute" : "Mute"}
+        <button id="mute" onClick={toggleMute} className="inline-flex min-h-11 cursor-pointer items-center justify-center rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium" type="button" aria-pressed={muted} disabled={forceMuted && muted && !isAdmin}>
+          {forceMuted && !isAdmin ? "Muted by host" : muted ? "Unmute" : "Mute"}
         </button>
         <button id="raise-hand" onClick={toggleHand} className="inline-flex min-h-11 cursor-pointer items-center justify-center rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium" type="button" aria-pressed={handRaised}>
           {handRaised ? "Lower hand" : "Raise hand"}
@@ -678,36 +1153,47 @@ function Room({
             </button>
           ))}
         </div>
-        <button id="leave" disabled={leaveDisabled} onClick={() => void leaveRoom()} className="inline-flex min-h-11 cursor-pointer grow items-center justify-center rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-50 sm:grow-0" type="button">
+        <button id="leave" disabled={leaveDisabled || endingCall} onClick={() => void leaveRoom()} className="inline-flex min-h-11 cursor-pointer grow items-center justify-center rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-50 sm:grow-0" type="button">
           Leave
         </button>
         {isAdmin && (
           <button
-            onClick={() =>
-              void (async () => {
-                try {
-                  const headers = new Headers();
-                  addLocalIdentity(headers);
-                  await fetch(
-                    `/api/recording/finalize?room=${encodeURIComponent(roomId)}`,
-                    { method: "POST", headers, credentials: "same-origin" },
-                  );
-                } catch {
-                  // End call even if finalize fails; chunks remain in R2.
-                }
-                send({ type: "end-call" });
-                await leaveRoom();
-              })()
-            }
-            className="inline-flex min-h-11 cursor-pointer items-center justify-center rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm font-medium text-red-700"
+            id="mute-all"
+            data-action="mute-all"
+            onClick={muteAll}
+            className="inline-flex min-h-11 cursor-pointer items-center justify-center rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium"
             type="button"
           >
-            End call
+            Mute all
+          </button>
+        )}
+        {isAdmin && (
+          <button
+            id="unmute-all"
+            data-action="unmute-all"
+            onClick={unmuteAll}
+            className="inline-flex min-h-11 cursor-pointer items-center justify-center rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium"
+            type="button"
+          >
+            Unmute all
+          </button>
+        )}
+        {isAdmin && (
+          <button
+            id="end-call"
+            disabled={leaveDisabled || endingCall || busy}
+            onClick={() => void endCall()}
+            className="inline-flex min-h-11 cursor-pointer items-center justify-center rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm font-medium text-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+            type="button"
+          >
+            {endingCall ? "Ending…" : "End call"}
           </button>
         )}
         <button
           disabled={!recordingMeta?.downloadable}
-          onClick={() => void download("/recording", "room-recording.wav")}
+          onClick={() =>
+            void download("/recording", recordingDownloadFilename(recordingMeta))
+          }
           className="inline-flex min-h-11 cursor-pointer items-center rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium disabled:opacity-50"
           type="button"
         >
@@ -728,7 +1214,7 @@ function Room({
         </div>
         <p className="mt-2 text-sm text-stone-700">{recordingStatus}</p>
         <p className="mt-2 text-xs text-stone-500">
-          Audio is captured on Cloudflare from the SFU (not your browser). Partial WAV download works while the meeting is still live. Max length is 3 hours. Files are deleted automatically after 7 days.
+          Audio is captured on Cloudflare from the SFU (not your browser). After the call ends, the recording is compressed to OGG Opus (~15 MB/hour). Max length is 3 hours. Files are deleted automatically after 7 days.
         </p>
       </div>
     </section>
@@ -769,10 +1255,13 @@ function ParticipantTile({
     const audio = ref.current;
     if (!audio) return;
     audio.srcObject = stream ?? null;
+    if (stream && !self) {
+      void audio.play().catch(() => undefined);
+    }
     return () => {
       audio.srcObject = null;
     };
-  }, [stream]);
+  }, [stream, self]);
   return (
     <figure className={`video-tile relative overflow-hidden rounded-lg border bg-stone-800 ${speaking ? "border-emerald-400" : "border-white/10"}`} data-participant={id}>
       <div className="flex aspect-video w-full items-center justify-center bg-stone-800">
@@ -780,7 +1269,7 @@ function ParticipantTile({
           {name.trim().slice(0, 1).toLocaleUpperCase()}
         </span>
       </div>
-      <audio ref={ref} className="sr-only" autoPlay muted={self} />
+      <audio ref={ref} className="sr-only" autoPlay playsInline muted={self} />
       {(muted || handRaised || reaction) && (
         <span className="absolute top-3 right-3 flex items-center gap-2 rounded-md bg-stone-950/80 px-2 py-1 text-sm text-white">
           {muted && <span>Muted</span>}
@@ -833,7 +1322,7 @@ function StatusBar({ message, tone }: RoomViewState["status"]) {
 }
 
 function RoomDownloads({ roomId }: { roomId: string }) {
-  const [available, setAvailable] = useState(false);
+  const [meta, setMeta] = useState<RecordingStatus | null>(null);
   const [error, setError] = useState("");
   useEffect(() => {
     let disposed = false;
@@ -846,8 +1335,8 @@ function RoomDownloads({ roomId }: { roomId: string }) {
           { headers, credentials: "same-origin" },
         );
         if (!response.ok) return;
-        const payload = (await response.json()) as { downloadable?: boolean };
-        if (!disposed) setAvailable(Boolean(payload.downloadable));
+        const payload = (await response.json()) as RecordingStatus;
+        if (!disposed) setMeta(payload.downloadable ? payload : null);
       } catch {
         // Lobby download is best-effort.
       }
@@ -859,7 +1348,7 @@ function RoomDownloads({ roomId }: { roomId: string }) {
       window.clearInterval(timer);
     };
   }, [roomId]);
-  if (!available) return null;
+  if (!meta) return null;
 
   const download = async (path: string, filename: string) => {
     try {
@@ -887,7 +1376,9 @@ function RoomDownloads({ roomId }: { roomId: string }) {
   return (
     <div className="mt-6 flex flex-wrap gap-2" aria-live="polite">
       <button
-        onClick={() => void download("/recording", "room-recording.wav")}
+        onClick={() =>
+          void download("/recording", recordingDownloadFilename(meta))
+        }
         className="inline-flex min-h-11 cursor-pointer items-center rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium"
         type="button"
       >
@@ -922,6 +1413,8 @@ function socketUrl(path: string, roomId: string, password: string): string {
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.searchParams.set("room", roomId);
   url.searchParams.set("password", password);
+  // Required for AUTH_MODE=skip — do not rely only on the WebSocket Proxy.
+  url.searchParams.set("guest", guestIdentity(roomId));
   if (
     location.hostname === "localhost" ||
     location.hostname === "127.0.0.1" ||
@@ -955,89 +1448,12 @@ function isRoomParticipant(value: unknown): value is RoomParticipant {
     typeof value.muted === "boolean" &&
     typeof value.handRaised === "boolean" &&
     typeof value.speaking === "boolean" &&
-    (value.role === "admin" || value.role === "participant")
+    (value.role === "admin" || value.role === "participant") &&
+    (value.forceMuted === undefined || typeof value.forceMuted === "boolean") &&
+    (value.mediaParticipantId === undefined ||
+      value.mediaParticipantId === null ||
+      typeof value.mediaParticipantId === "string")
   );
-}
-
-function passwordStorageKey(roomId: string): string {
-  return `video-room-password-${roomId}`;
-}
-
-function cacheRoomPasswordFromUrl(): void {
-  const url = new URL(location.href);
-  const password = url.searchParams.get("password");
-  const match = /^\/rooms\/([a-z0-9][a-z0-9-]{0,63})\/?$/.exec(url.pathname);
-  if (!password || !match?.[1]) return;
-  sessionStorage.setItem(passwordStorageKey(match[1]), password);
-  url.searchParams.delete("password");
-  history.replaceState(history.state, "", url);
-}
-
-function installRoomPasswordPropagation(): void {
-  const originalFetch = window.fetch.bind(window);
-  window.fetch = (input, init) => {
-    const requestUrl = new URL(
-      input instanceof Request ? input.url : String(input),
-      location.href,
-    );
-    if (requestUrl.origin !== location.origin) return originalFetch(input, init);
-    const roomId = roomIdFromRequestUrl(requestUrl);
-    if (!roomId) return originalFetch(input, init);
-    const password = sessionStorage.getItem(passwordStorageKey(roomId));
-    const headers = new Headers(input instanceof Request ? input.headers : undefined);
-    new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
-    const guestId = guestIdentity(roomId);
-    headers.set("x-room-guest-id", guestId);
-    if (password) headers.set("x-room-password", password);
-    return originalFetch(input, { ...init, headers });
-  };
-
-  const NativeWebSocket = window.WebSocket;
-  window.WebSocket = new Proxy(NativeWebSocket, {
-    construct(target, args, newTarget) {
-      const requestUrl = new URL(String(args[0]), location.href);
-      if (requestUrl.origin === location.origin) {
-        const roomId = roomIdFromRequestUrl(requestUrl);
-        if (roomId) requestUrl.searchParams.set("guest", guestIdentity(roomId));
-        const password = roomId
-          ? sessionStorage.getItem(passwordStorageKey(roomId))
-          : null;
-        if (password) requestUrl.searchParams.set("password", password);
-      }
-      return Reflect.construct(
-        target,
-        [requestUrl.toString(), ...args.slice(1)],
-        newTarget,
-      ) as WebSocket;
-    },
-  });
-}
-
-function roomIdFromRequestUrl(url: URL): string | undefined {
-  const apiMatch = /^\/api\/rooms\/([a-z0-9][a-z0-9-]{0,63})(?:\/|$)/.exec(
-    url.pathname,
-  );
-  if (apiMatch?.[1]) return apiMatch[1];
-  if (
-    url.pathname === "/api/recording/status" ||
-    url.pathname === "/api/recording/finalize" ||
-    url.pathname === "/api/recording/pcm" ||
-    url.pathname === "/recording" ||
-    url.pathname === "/ws/room" ||
-    url.pathname === "/ws/recording"
-  ) {
-    return url.searchParams.get("room") ?? undefined;
-  }
-  return undefined;
-}
-
-function guestIdentity(roomId: string): string {
-  const key = `video-room-guest-${roomId}`;
-  const existing = sessionStorage.getItem(key);
-  if (existing && /^[0-9a-f-]{36}$/i.test(existing)) return existing;
-  const created = crypto.randomUUID();
-  sessionStorage.setItem(key, created);
-  return created;
 }
 
 function isTextInputTarget(target: EventTarget | null): boolean {

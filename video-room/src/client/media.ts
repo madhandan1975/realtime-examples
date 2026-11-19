@@ -23,6 +23,11 @@ export class MediaSessions {
   private readonly producerQueue = new SerialMutationQueue(retryDecision);
   private readonly referencesByMid = new Map<string, TrackReference>();
   private closed = false;
+  private connectionLostNotified = false;
+  private micTrack: MediaStreamTrack | null = null;
+  private silentTrack: MediaStreamTrack | null = null;
+  private silentContext: AudioContext | null = null;
+  private onConnectionLost: () => void = () => undefined;
 
   constructor(
     private readonly api: RoomApi,
@@ -31,6 +36,12 @@ export class MediaSessions {
     private readonly onRemoteTrack: RemoteTrackHandler,
     onConnectionLost: () => void,
   ) {
+    this.onConnectionLost = () => {
+      if (this.closed || this.connectionLostNotified) return;
+      this.connectionLostNotified = true;
+      onConnectionLost();
+    };
+    const notifyLost = () => this.onConnectionLost();
     this.consumer.addEventListener("track", (event) => {
       if (this.closed) return;
       const mid = event.transceiver.mid;
@@ -40,15 +51,16 @@ export class MediaSessions {
     for (const peer of [this.producer, this.consumer]) {
       peer.addEventListener("connectionstatechange", () => {
         if (this.closed) return;
-        if (peer.connectionState === "failed") onConnectionLost();
+        // Let ICE recover brief blips; only replace after sustained loss / failed.
+        if (peer.connectionState === "failed") notifyLost();
         const disconnectedTimer = this.disconnectedTimers.get(peer);
         if (peer.connectionState === "disconnected") {
           if (disconnectedTimer === undefined) {
             this.disconnectedTimers.set(
               peer,
               setTimeout(() => {
-                if (!this.closed) onConnectionLost();
-              }, 5_000),
+                if (!this.closed) notifyLost();
+              }, DISCONNECT_GRACE_MS),
             );
           }
         } else if (disconnectedTimer !== undefined) {
@@ -56,6 +68,40 @@ export class MediaSessions {
           this.disconnectedTimers.delete(peer);
         }
       });
+    }
+  }
+
+  /**
+   * Mute without `track.enabled = false`. Disabled tracks stop RTP and Cloudflare
+   * SFU garbage-collects the publication after ~30s, so unmute stays silent.
+   * Replace the sender with a silent keepalive track instead.
+   */
+  setLocalAudioMuted(muted: boolean): void {
+    if (this.closed) return;
+    for (const sender of this.producer.getSenders()) {
+      if (!sender.track || sender.track.kind !== "audio") continue;
+      if (muted) {
+        if (sender.track !== this.silentTrack) {
+          this.micTrack = sender.track;
+          // Keep the mic track object alive and enabled for meters / unmute.
+          sender.track.enabled = true;
+        }
+        void sender.replaceTrack(this.ensureSilentTrack());
+      } else {
+        const mic =
+          this.micTrack && this.micTrack.readyState === "live"
+            ? this.micTrack
+            : (this.localStream.getAudioTracks().find(
+                (track) => track.readyState === "live",
+              ) ?? null);
+        if (!mic) {
+          this.onConnectionLost();
+          return;
+        }
+        mic.enabled = true;
+        this.micTrack = mic;
+        void sender.replaceTrack(mic);
+      }
     }
   }
 
@@ -73,9 +119,10 @@ export class MediaSessions {
     await this.producerQueue.enqueue(async () => {
       if (!prepared) {
         await waitForStable(this.producer);
-        const transceivers = this.localStream.getTracks().map((track) =>
-          this.producer.addTransceiver(track, { direction: "sendonly" }),
-        );
+        const transceivers = this.localStream.getTracks().map((track) => {
+          if (track.kind === "audio") this.micTrack = track;
+          return this.producer.addTransceiver(track, { direction: "sendonly" });
+        });
         const offer = await this.producer.createOffer();
         await this.producer.setLocalDescription(offer);
         await waitForIceGathering(this.producer);
@@ -166,8 +213,35 @@ export class MediaSessions {
     );
     for (const timer of this.disconnectedTimers.values()) clearTimeout(timer);
     this.disconnectedTimers.clear();
+    this.silentTrack?.stop();
+    this.silentTrack = null;
+    const silentContext = this.silentContext;
+    this.silentContext = null;
+    if (silentContext) void silentContext.close();
     this.producer.close();
     this.consumer.close();
+  }
+
+  private ensureSilentTrack(): MediaStreamTrack {
+    if (this.silentTrack && this.silentTrack.readyState === "live") {
+      return this.silentTrack;
+    }
+    const context = new AudioContext();
+    this.silentContext = context;
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    gain.gain.value = 0;
+    const destination = context.createMediaStreamDestination();
+    oscillator.connect(gain);
+    gain.connect(destination);
+    oscillator.start();
+    void context.resume();
+    const track = destination.stream.getAudioTracks()[0];
+    if (!track) {
+      throw new Error("Failed to create a silent audio keepalive track.");
+    }
+    this.silentTrack = track;
+    return track;
   }
 
   async closeAndWait(timeoutMs: number): Promise<void> {
@@ -175,6 +249,9 @@ export class MediaSessions {
     await Promise.race([this.idle(), delay(timeoutMs)]);
   }
 }
+
+/** Brief ICE `disconnected` often self-heals; avoid tearing the SFU session down. */
+const DISCONNECT_GRACE_MS = 15_000;
 
 function createPeerConnection(): RTCPeerConnection {
   return new RTCPeerConnection({

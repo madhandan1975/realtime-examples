@@ -4,27 +4,83 @@ type RecordingStatus = {
   adapters?: number;
   bytesRecorded: number;
   chunkCount: number;
+  downloadFilename?: string | null;
   downloadable: boolean;
   elapsedMs: number;
   expiresAt?: number | null;
   finalized: boolean;
+  format?: string | null;
   lastError?: string | null;
   packetsReceived?: number;
   packetsRejected?: number;
   recordingId: string | null;
   retentionDays?: number;
+  startedAt?: number | null;
   status: string;
   tracks?: number;
 };
 
+type PurgeResult = {
+  bucketClear?: boolean;
+  deletedObjects?: number;
+  failures?: Array<{ room: string; error: string }>;
+  ok?: boolean;
+  purgedRooms?: string[];
+  remainingObjects?: number;
+  error?: { message?: string };
+};
+
+function recordingDownloadFilename(status: RecordingStatus): string {
+  if (status.downloadFilename) return status.downloadFilename;
+  if (status.startedAt) {
+    const date = new Date(status.startedAt);
+    const y = date.getUTCFullYear();
+    const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(date.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${d}.ogg`;
+  }
+  return "recording.ogg";
+}
+
 const ROOM_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+function knownRoomsFromSession(): string[] {
+  const rooms = new Set<string>();
+  for (let index = 0; index < sessionStorage.length; index += 1) {
+    const key = sessionStorage.key(index);
+    if (!key) continue;
+    const match = /^(?:video-room-guest|video-room-password|video-room-create-secret)-(.+)$/.exec(
+      key,
+    );
+    const room = match?.[1];
+    if (room && ROOM_ID.test(room)) rooms.add(room);
+  }
+  return [...rooms];
+}
+
+function clearRoomSessionData(rooms: string[]): void {
+  for (const room of rooms) {
+    sessionStorage.removeItem(`video-room-guest-${room}`);
+    sessionStorage.removeItem(`video-room-password-${room}`);
+    sessionStorage.removeItem(`video-room-create-secret-${room}`);
+  }
+  sessionStorage.removeItem("video-room-joined");
+  sessionStorage.removeItem("video-room-token");
+}
 
 export function AdminPortal() {
   const [roomId, setRoomId] = useState("");
   const [password, setPassword] = useState("");
+  const [createSecret, setCreateSecret] = useState("");
+  const [extraRooms, setExtraRooms] = useState("");
   const [status, setStatus] = useState<RecordingStatus | null>(null);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState("Enter a room name and its password to look up the recording.");
+  const [message, setMessage] = useState(
+    "Enter a room name and its password to look up the recording.",
+  );
+  const [purgeMessage, setPurgeMessage] = useState(
+    "Wipe every recording in R2 and reset known room Durable Objects. Requires the host create key.",
+  );
 
   const lookup = async () => {
     const room = roomId.trim().toLowerCase();
@@ -65,7 +121,7 @@ export function AdminPortal() {
       setStatus(next);
       setMessage(
         next.downloadable
-          ? "Recording found. You can download the WAV."
+          ? `Recording found. You can download ${recordingDownloadFilename(next)}.`
           : next.lastError
             ? `No downloadable audio (${next.status}): ${next.lastError}`
             : `No downloadable audio yet (status: ${next.status}). Join a new call to start a fresh recording.`,
@@ -102,12 +158,75 @@ export function AdminPortal() {
       const objectUrl = URL.createObjectURL(await response.blob());
       const anchor = document.createElement("a");
       anchor.href = objectUrl;
-      anchor.download = `${room}-recording.wav`;
+      anchor.download = status
+        ? recordingDownloadFilename(status)
+        : "recording.ogg";
       anchor.click();
       URL.revokeObjectURL(objectUrl);
       setMessage("Download started.");
     } catch {
       setMessage("Download failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const purgeAll = async () => {
+    const secret = createSecret.trim();
+    if (!secret) {
+      setPurgeMessage("Enter the host create key to purge.");
+      return;
+    }
+    const typedRooms = extraRooms
+      .split(/[\s,]+/)
+      .map((item) => item.trim().toLowerCase())
+      .filter((item) => ROOM_ID.test(item));
+    const rooms = [...new Set([...knownRoomsFromSession(), ...typedRooms])];
+    if (
+      !confirm(
+        rooms.length > 0
+          ? `Delete all recordings and reset ${rooms.length} known room(s) plus any rooms found in R2? This cannot be undone.`
+          : "Delete all recordings in R2 and reset any rooms found there? This cannot be undone.",
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setPurgeMessage("Purging rooms and recordings…");
+    try {
+      const response = await fetch("/api/admin/purge-all", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "content-type": "application/json",
+          "x-room-create-secret": secret,
+        },
+        body: JSON.stringify({ rooms }),
+      });
+      const payload = (await response.json().catch(() => null)) as PurgeResult | null;
+      if (!response.ok) {
+        setPurgeMessage(
+          payload?.error?.message ?? `Purge failed (${response.status}).`,
+        );
+        return;
+      }
+      clearRoomSessionData(payload?.purgedRooms ?? rooms);
+      setStatus(null);
+      const purged = payload?.purgedRooms?.length ?? 0;
+      const objects = payload?.deletedObjects ?? 0;
+      const failed = payload?.failures?.length ?? 0;
+      const remaining = payload?.remainingObjects ?? 0;
+      const clear = payload?.bucketClear === true;
+      setPurgeMessage(
+        !clear
+          ? `Partial purge: deleted ${objects} object(s), ${remaining}+ still in the recordings bucket. Run Delete again.`
+          : failed > 0
+            ? `Recordings bucket is empty (${objects} deleted). Reset ${purged} room(s); ${failed} room reset(s) failed.`
+            : `Recordings bucket is empty (${objects} deleted). Reset ${purged} room(s). You can create a fresh room now.`,
+      );
+      setMessage("Lookup state cleared after purge.");
+    } catch {
+      setPurgeMessage("Could not reach the purge endpoint.");
     } finally {
       setBusy(false);
     }
@@ -127,7 +246,7 @@ export function AdminPortal() {
           Recording admin
         </h1>
         <p className="mt-2 text-sm leading-6 text-stone-600">
-          Look up a room by name and password, then download the server WAV.
+          Look up a room by name and password, then download the OGG Opus recording.
           Recordings are deleted automatically after 7 days.
         </p>
       </header>
@@ -181,7 +300,7 @@ export function AdminPortal() {
             onClick={() => void download()}
             type="button"
           >
-            Download WAV
+            Download recording
           </button>
         </div>
       </form>
@@ -241,6 +360,61 @@ export function AdminPortal() {
           )}
         </dl>
       )}
+
+      <section className="mt-8 rounded-xl border border-red-200 bg-red-50 p-5">
+        <h2 className="text-base font-semibold text-red-900">
+          Delete all rooms &amp; recordings
+        </h2>
+        <p className="mt-2 text-sm leading-6 text-red-900/80">
+          Removes every object in the recordings bucket and resets RoomDO,
+          RecordingDO, and VideoRoom for rooms found in R2 plus any rooms listed
+          below or remembered in this browser.
+        </p>
+
+        <label
+          className="mt-4 block text-sm font-medium text-red-950"
+          htmlFor="admin-create-secret"
+        >
+          Host create key
+        </label>
+        <input
+          id="admin-create-secret"
+          autoComplete="off"
+          className="mt-1.5 w-full rounded-lg border border-red-200 bg-white px-3 py-2.5 text-sm"
+          placeholder="ROOM_CREATE_SECRET"
+          type="password"
+          value={createSecret}
+          onChange={(event) => setCreateSecret(event.target.value)}
+        />
+
+        <label
+          className="mt-4 block text-sm font-medium text-red-950"
+          htmlFor="admin-extra-rooms"
+        >
+          Extra room names (optional)
+        </label>
+        <input
+          id="admin-extra-rooms"
+          autoComplete="off"
+          className="mt-1.5 w-full rounded-lg border border-red-200 bg-white px-3 py-2.5 text-sm"
+          placeholder="room-one, room-two"
+          value={extraRooms}
+          onChange={(event) => setExtraRooms(event.target.value)}
+        />
+
+        <button
+          className="mt-5 inline-flex min-h-11 cursor-pointer items-center rounded-lg bg-red-700 px-4 py-2 text-sm font-semibold text-white enabled:hover:bg-red-800 disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={busy}
+          onClick={() => void purgeAll()}
+          type="button"
+        >
+          Delete all rooms &amp; recordings
+        </button>
+
+        <p className="mt-3 text-sm text-red-950" role="status">
+          {purgeMessage}
+        </p>
+      </section>
     </div>
   );
 }

@@ -1,3 +1,4 @@
+import "./ws-bootstrap";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { AdminPortal } from "./AdminPortal";

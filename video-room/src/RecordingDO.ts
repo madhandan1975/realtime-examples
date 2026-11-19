@@ -1,5 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 
+import {
+  encodeStereoPcmToOggOpus,
+  oggDownloadFilename,
+  OPUS_BITRATE_KBPS,
+  OPUS_CHANNELS,
+} from "./server/opus-ogg";
 import { extractPcmFromSfuPacket } from "./server/pcm-packet";
 import { RealtimeSfuClient, type RealtimeEnv } from "./server/realtime";
 
@@ -15,23 +21,32 @@ type RecordingEnvironment = RealtimeEnv & {
 
 type AdapterState = {
   adapterId: string;
+  /** Set when the PCM socket drops; SFU egress reconnects+buffers for ~15s. */
+  disconnectedAt?: number | null;
   sessionId: string;
   trackName: string;
 };
 
 type RecordingState = {
   adapters: AdapterState[];
+  bitrateKbps: number | null;
   bytesRecorded: number;
+  channels: number;
   chunkCount: number;
   chunks: Array<{ bytes: number; key: string; samples: number }>;
   desiredTracks: RecordingTrack[];
+  downloadFilename: string | null;
+  downloadKey: string | null;
   expiresAt: number | null;
   finalized: boolean;
+  format: "pcm/wav" | "ogg/opus" | null;
   lastError: string | null;
   maxEndsAt: number;
   packetsReceived: number;
   packetsRejected: number;
   recordingId: string;
+  /** True after a ready take saw zero tracks — next non-empty sync may start a new session. */
+  releasedForNext?: boolean;
   roomId: string;
   sampleRate: number;
   startedAt: number;
@@ -48,7 +63,8 @@ const MAX_DURATION_MS = 3 * 60 * 60 * 1000;
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const SAMPLE_RATE = 48_000;
 const MAX_PENDING_BYTES = 4_000_000;
-const ADAPTER_HEAL_MS = 5_000;
+/** Match Cloudflare Realtime SFU WebSocket egress reconnect+buffer window. */
+const SFU_ADAPTER_RECONNECT_MS = 15_000;
 
 export class RecordingDO extends DurableObject<RecordingEnvironment> {
   private state: RecordingState = emptyState("");
@@ -67,6 +83,11 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
       this.state.lastError ??= null;
       this.state.packetsReceived ??= 0;
       this.state.packetsRejected ??= 0;
+      this.state.bitrateKbps ??= null;
+      this.state.channels ??= 2;
+      this.state.downloadFilename ??= null;
+      this.state.downloadKey ??= null;
+      this.state.format ??= null;
       if (
         this.state.expiresAt &&
         this.state.expiresAt > Date.now() &&
@@ -98,7 +119,31 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
     if (url.pathname === "/socket" && request.method === "GET") {
       return this.openStatusSocket(request);
     }
+    if (url.pathname === "/purge" && request.method === "POST") {
+      return this.purge();
+    }
     return new Response("Not found", { status: 404 });
+  }
+
+  private async purge(): Promise<Response> {
+    return this.serial(async () => {
+      for (const socket of [...this.ctx.getWebSockets()]) {
+        try {
+          socket.close(4003, "Recording purged.");
+        } catch {
+          // Best-effort.
+        }
+      }
+      const roomId = this.state.roomId || (this.ctx.id.name ?? "");
+      if (roomId) {
+        await deletePrefix(this.env.RECORDINGS, `${roomId}/`);
+      }
+      this.pendingByTrack.clear();
+      this.pendingSamples = 0;
+      await this.ctx.storage.deleteAll();
+      this.state = emptyState(roomId);
+      return Response.json({ ok: true });
+    });
   }
 
   async alarm(): Promise<void> {
@@ -162,18 +207,28 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
 
   webSocketClose(socket: WebSocket): void {
     const attachment = socket.deserializeAttachment() as PcmSocketAttachment | null;
-    if (!attachment) return;
+    if (!attachment?.sessionId || !attachment.trackName) return;
     void this.serial(async () => {
       if (this.state.status !== "recording") return;
-      this.state.adapters = this.state.adapters.filter(
-        (item) =>
-          !(
-            item.sessionId === attachment.sessionId &&
-            item.trackName === attachment.trackName
-          ),
-      );
-      await this.persist();
-      await this.ctx.storage.setAlarm(Date.now() + ADAPTER_HEAL_MS);
+      // Do not drop adapterId or create a replacement yet — SFU egress already
+      // retries this endpoint with media buffering for SFU_ADAPTER_RECONNECT_MS.
+      let changed = false;
+      for (const adapter of this.state.adapters) {
+        if (
+          adapter.sessionId === attachment.sessionId &&
+          adapter.trackName === attachment.trackName &&
+          !adapter.disconnectedAt
+        ) {
+          adapter.disconnectedAt = Date.now();
+          changed = true;
+        }
+      }
+      if (changed) await this.persist();
+      const healAt = Date.now() + SFU_ADAPTER_RECONNECT_MS;
+      const existing = await this.ctx.storage.getAlarm();
+      if (existing === null || existing > healAt) {
+        await this.ctx.storage.setAlarm(healAt);
+      }
     });
   }
 
@@ -201,16 +256,28 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
         if (this.state.status === "recording") {
           await this.flushPending(true);
           await this.finalizeLocked("no_tracks");
+        } else if (
+          this.state.status === "ready" ||
+          this.state.status === "failed"
+        ) {
+          // Room emptied — keep downloadable metadata; allow the next join to start fresh.
+          this.state.releasedForNext = true;
+          this.state.desiredTracks = [];
+          await this.persist();
         }
         return Response.json(this.publicStatus());
       }
 
-      // A finished/failed session must not block the next meeting in this room.
+      // Do not wipe a ready recording while End-call leave still has publishers.
       if (
         this.state.finalized ||
         this.state.status === "ready" ||
         this.state.status === "failed"
       ) {
+        if (!this.state.releasedForNext) {
+          return Response.json(this.publicStatus());
+        }
+        // Prior take was downloadable and the room had gone empty — new meeting.
         this.state = emptyState(roomId);
         this.state.desiredTracks = tracks;
       }
@@ -232,6 +299,25 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
     });
   }
 
+  private livePcmTrackKeys(): Set<string> {
+    const keys = new Set<string>();
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() as
+        | PcmSocketAttachment
+        | { kind?: string }
+        | null;
+      if (
+        attachment &&
+        "sessionId" in attachment &&
+        typeof attachment.sessionId === "string" &&
+        typeof attachment.trackName === "string"
+      ) {
+        keys.add(trackKey(attachment.sessionId, attachment.trackName));
+      }
+    }
+    return keys;
+  }
+
   private async healAdapters(): Promise<void> {
     if (this.state.status !== "recording") return;
     const hostname = this.env.WORKER_HOSTNAME?.trim();
@@ -248,6 +334,8 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
         trackKey(track.sessionId, track.trackName),
       ),
     );
+    const liveKeys = this.livePcmTrackKeys();
+    const now = Date.now();
     const sfu = new RealtimeSfuClient(this.env);
 
     const nextAdapters: AdapterState[] = [];
@@ -257,7 +345,20 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
         await sfu.closeWebSocketAdapter(adapter.adapterId).catch(() => undefined);
         continue;
       }
-      nextAdapters.push(adapter);
+      if (liveKeys.has(key)) {
+        nextAdapters.push({ ...adapter, disconnectedAt: null });
+        continue;
+      }
+      // Socket down: wait out SFU reconnect+buffer before replacing.
+      const disconnectedAt = adapter.disconnectedAt ?? now;
+      if (now - disconnectedAt < SFU_ADAPTER_RECONNECT_MS) {
+        nextAdapters.push({
+          ...adapter,
+          disconnectedAt,
+        });
+        continue;
+      }
+      await sfu.closeWebSocketAdapter(adapter.adapterId).catch(() => undefined);
     }
     this.state.adapters = nextAdapters;
 
@@ -266,7 +367,7 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
     );
     for (const track of this.state.desiredTracks) {
       const key = trackKey(track.sessionId, track.trackName);
-      if (activeKeys.has(key)) continue;
+      if (activeKeys.has(key) || liveKeys.has(key)) continue;
       const endpoint = `wss://${hostname}/api/recording/pcm?room=${encodeURIComponent(this.state.roomId)}&sessionId=${encodeURIComponent(track.sessionId)}&trackName=${encodeURIComponent(track.trackName)}`;
       try {
         const { adapterId, error } = await sfu.pullTrackToWebSocket(
@@ -413,9 +514,20 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
     this.state.adapters = [];
     this.state.desiredTracks = [];
 
-    await this.writeManifest(reason);
     this.state.finalized = true;
     if (this.state.chunks.length > 0) {
+      try {
+        await this.encodeAndStoreOgg();
+        this.state.status = "ready";
+        this.state.lastError = null;
+      } catch (error) {
+        this.state.status = "failed";
+        this.state.lastError =
+          error instanceof Error
+            ? `Opus encode failed: ${error.message}`
+            : "Opus encode failed.";
+      }
+    } else if (this.state.downloadKey) {
       this.state.status = "ready";
     } else {
       this.state.status = "failed";
@@ -425,9 +537,51 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
           : "Recording ended with no SFU audio packets (adapters never delivered PCM).";
     }
     this.state.expiresAt = Date.now() + RETENTION_MS;
+    await this.writeManifest(reason);
     await this.persist();
     await this.ctx.storage.setAlarm(this.state.expiresAt);
     this.broadcastStatus();
+  }
+
+  private async encodeAndStoreOgg(): Promise<void> {
+    const pcmChunks = this.state.chunks.slice();
+    const bucket = this.env.RECORDINGS;
+    const oggBytes = await encodeStereoPcmToOggOpus(
+      (async function* () {
+        for (const chunk of pcmChunks) {
+          const object = await bucket.get(chunk.key);
+          if (!object) {
+            throw new Error(`Missing PCM chunk ${chunk.key}`);
+          }
+          yield new Uint8Array(await object.arrayBuffer());
+        }
+      })(),
+    );
+
+    const downloadKey = `${this.state.roomId}/${this.state.recordingId}/audio.ogg`;
+    const downloadFilename = oggDownloadFilename(this.state.startedAt);
+    await bucket.put(downloadKey, oggBytes, {
+      httpMetadata: {
+        contentType: "audio/ogg",
+        contentDisposition: `attachment; filename="${downloadFilename}"`,
+      },
+      customMetadata: {
+        bitrateKbps: String(OPUS_BITRATE_KBPS),
+        channels: String(OPUS_CHANNELS),
+        format: "ogg/opus",
+      },
+    });
+
+    await Promise.all(pcmChunks.map((chunk) => bucket.delete(chunk.key)));
+
+    this.state.bitrateKbps = OPUS_BITRATE_KBPS;
+    this.state.bytesRecorded = oggBytes.byteLength;
+    this.state.channels = OPUS_CHANNELS;
+    this.state.chunkCount = 0;
+    this.state.chunks = [];
+    this.state.downloadFilename = downloadFilename;
+    this.state.downloadKey = downloadKey;
+    this.state.format = "ogg/opus";
   }
 
   private async purgeExpired(): Promise<void> {
@@ -458,11 +612,16 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
 
   private async writeManifest(reason?: string): Promise<void> {
     const manifest = {
+      bitrateKbps: this.state.bitrateKbps,
       bytesRecorded: this.state.bytesRecorded,
+      channels: this.state.channels,
       chunkCount: this.state.chunkCount,
       chunks: this.state.chunks,
+      downloadFilename: this.state.downloadFilename,
+      downloadKey: this.state.downloadKey,
       expiresAt: this.state.expiresAt,
       finalized: this.state.finalized,
+      format: this.state.format,
       maxEndsAt: this.state.maxEndsAt,
       reason,
       recordingId: this.state.recordingId,
@@ -492,6 +651,15 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
     ) {
       return new Response("Recording expired and was deleted.", { status: 410 });
     }
+
+    const downloadKey = this.state.downloadKey;
+    if (downloadKey) {
+      return this.streamOgg(
+        downloadKey,
+        this.state.downloadFilename ?? oggDownloadFilename(this.state.startedAt),
+      );
+    }
+
     const chunks = this.state.chunks;
     if (!chunks.length) {
       const latest = await this.env.RECORDINGS.get(
@@ -500,7 +668,10 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
       if (!latest) return new Response("Recording not found.", { status: 404 });
       const parsed = (await latest.json()) as {
         chunks?: typeof chunks;
+        downloadFilename?: string | null;
+        downloadKey?: string | null;
         expiresAt?: number | null;
+        startedAt?: number;
       };
       if (
         typeof parsed.expiresAt === "number" &&
@@ -510,12 +681,40 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
           status: 410,
         });
       }
+      if (parsed.downloadKey) {
+        return this.streamOgg(
+          parsed.downloadKey,
+          parsed.downloadFilename ??
+            oggDownloadFilename(parsed.startedAt ?? this.state.startedAt),
+        );
+      }
       if (!parsed.chunks?.length) {
         return new Response("Recording not found.", { status: 404 });
       }
       return this.streamWav(parsed.chunks, this.state.sampleRate);
     }
     return this.streamWav(chunks, this.state.sampleRate);
+  }
+
+  private async streamOgg(
+    key: string,
+    filename: string,
+  ): Promise<Response> {
+    const object = await this.env.RECORDINGS.get(key);
+    if (!object) {
+      return new Response("Recording not found.", { status: 404 });
+    }
+    const headers = new Headers();
+    headers.set("cache-control", "no-store");
+    headers.set("content-type", "audio/ogg");
+    headers.set(
+      "content-disposition",
+      `attachment; filename="${filename.replace(/"/g, "")}"`,
+    );
+    if (typeof object.size === "number") {
+      headers.set("content-length", String(object.size));
+    }
+    return new Response(object.body, { headers });
   }
 
   private streamWav(
@@ -564,14 +763,25 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
     const expired =
       typeof this.state.expiresAt === "number" &&
       this.state.expiresAt <= Date.now();
+    const downloadFilename =
+      this.state.downloadFilename ??
+      (this.state.downloadKey || this.state.format === "ogg/opus"
+        ? oggDownloadFilename(this.state.startedAt)
+        : null);
     return {
       adapters: this.state.adapters.length,
+      bitrateKbps: this.state.bitrateKbps,
       bytesRecorded: this.state.bytesRecorded,
+      channels: this.state.channels,
       chunkCount: this.state.chunkCount,
-      downloadable: this.state.chunkCount > 0 && !expired,
+      downloadFilename,
+      downloadable:
+        !expired &&
+        (Boolean(this.state.downloadKey) || this.state.chunkCount > 0),
       elapsedMs,
       expiresAt: this.state.expiresAt,
       finalized: this.state.finalized,
+      format: this.state.format,
       lastError: this.state.lastError,
       maxDurationMs: MAX_DURATION_MS,
       packetsReceived: this.state.packetsReceived,
@@ -581,6 +791,7 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
         ? Math.max(0, this.state.maxEndsAt - Date.now())
         : MAX_DURATION_MS,
       retentionDays: 7,
+      startedAt: this.state.startedAt || null,
       status: this.state.status,
       tracks: this.state.desiredTracks.length,
     };
@@ -621,17 +832,23 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
 function emptyState(roomId: string): RecordingState {
   return {
     adapters: [],
+    bitrateKbps: null,
     bytesRecorded: 0,
+    channels: 2,
     chunkCount: 0,
     chunks: [],
     desiredTracks: [],
+    downloadFilename: null,
+    downloadKey: null,
     expiresAt: null,
     finalized: false,
+    format: null,
     lastError: null,
     maxEndsAt: 0,
     packetsReceived: 0,
     packetsRejected: 0,
     recordingId: "",
+    releasedForNext: false,
     roomId,
     sampleRate: SAMPLE_RATE,
     startedAt: 0,

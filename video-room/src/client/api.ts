@@ -19,7 +19,7 @@ import {
   type SubscriptionResponse,
 } from "../shared/protocol";
 
-export const CLIENT_REQUEST_TIMEOUT_MS = 15_000;
+export const CLIENT_REQUEST_TIMEOUT_MS = 30_000;
 export const CLIENT_CLEANUP_REQUEST_TIMEOUT_MS = 60_000;
 
 export class ApiError extends Error {
@@ -43,6 +43,14 @@ export class RoomApi {
     private readonly localIdentity: string,
     private readonly requestTimeoutMs = CLIENT_REQUEST_TIMEOUT_MS,
   ) {}
+
+  async create(signal?: AbortSignal): Promise<{ ok: true }> {
+    return this.request("create", okResponseSchema, {
+      method: "POST",
+      signal,
+      withToken: false,
+    });
+  }
 
   async join(
     clientId: string,
@@ -99,6 +107,17 @@ export class RoomApi {
   notificationSocketUrl(): string {
     const url = new URL(this.url("socket"), location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    const password = sessionStorage.getItem(
+      `video-room-password-${this.roomId}`,
+    );
+    if (password) url.searchParams.set("password", password);
+    const guestKey = `video-room-guest-${this.roomId}`;
+    let guest = sessionStorage.getItem(guestKey);
+    if (!guest || !/^[0-9a-f-]{36}$/i.test(guest)) {
+      guest = crypto.randomUUID();
+      sessionStorage.setItem(guestKey, guest);
+    }
+    url.searchParams.set("guest", guest);
     return url.toString();
   }
 
@@ -145,6 +164,18 @@ export class RoomApi {
       signal,
       timeoutMs: CLIENT_CLEANUP_REQUEST_TIMEOUT_MS,
     });
+  }
+
+  /** Best-effort leave for tab close; must not await (page is dying). */
+  leaveKeepalive(): void {
+    const headers = this.headers(true);
+    void fetch(this.url("leave"), {
+      body: "{}",
+      credentials: "same-origin",
+      headers,
+      keepalive: true,
+      method: "POST",
+    }).catch(() => undefined);
   }
 
   terminate(signal?: AbortSignal): Promise<RoomSnapshot> {

@@ -6,6 +6,7 @@ interface __BaseEnv_Env {
 	AI: Ai;
 	ASSETS: Fetcher;
 	AUTH_MODE: string;
+	ROOM_CREATE_SECRET?: string;
 	ROOM_PASSWORD_REQUIRED: string;
 	ROOM_STALE_SECONDS: string;
 	ROOMS: DurableObjectNamespace<import("./src/worker").VideoRoom>;

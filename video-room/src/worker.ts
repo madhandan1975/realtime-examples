@@ -10,7 +10,7 @@ import {
   type AuthEnv,
   type AuthenticatedPrincipal,
 } from "./server/auth";
-import { errorResponse, rpcResponse } from "./server/http";
+import { errorResponse, jsonResponse, rpcResponse } from "./server/http";
 import type { RealtimeEnv } from "./server/realtime";
 import { type RoomRpcContext, VideoRoom } from "./server/video-room";
 import { RecordingDO } from "./RecordingDO";
@@ -30,6 +30,7 @@ export { RecordingDO, RoomDO, VideoRoom };
 type WorkerEnv = Env &
   AuthEnv &
   RealtimeEnv & {
+    ROOM_CREATE_SECRET?: string;
     ROOM_PASSWORD_REQUIRED?: string;
   };
 type ExtendedWorkerEnv = WorkerEnv & {
@@ -87,7 +88,8 @@ app.use(roomRoute, async (c, next) => {
   }
   if (c.req.method !== "GET") assertSameOrigin(c.req.raw);
   const principal = await authenticateApplicationRequest(c.req.raw, c.env);
-  if (c.req.param("action") !== "join") {
+  const action = c.req.param("action");
+  if (action !== "join" && action !== "create") {
     await checkRoomPassword(
       c.env,
       roomId.data,
@@ -127,12 +129,23 @@ app.get("/socket", (c) => {
   );
 });
 
-app.post("/join", jsonRequest(joinRequestSchema, withDisplayHint), async (c) => {
+app.post("/create", async (c) => {
   await checkRoomPassword(
     c.env,
     c.get("roomId"),
     c.req.header("x-room-password"),
     true,
+    c.req.header("x-room-create-secret"),
+    c.get("rpc").principal.subject,
+  );
+  return jsonResponse({ ok: true as const }, 200, c.get("requestId"));
+});
+app.post("/join", jsonRequest(joinRequestSchema, withDisplayHint), async (c) => {
+  await checkRoomPassword(
+    c.env,
+    c.get("roomId"),
+    c.req.header("x-room-password"),
+    false,
   );
   return rpcResponse(
     await c.get("room").join(c.get("rpc"), c.req.valid("json")),
@@ -286,9 +299,8 @@ async function handleExtendedRoute(
   ) {
     assertSameOrigin(request);
     const room = validRoom(url.searchParams.get("room"));
-    const principal = await authenticateApplicationRequest(request, env);
-    await checkRoomPassword(env, room, request.headers.get("x-room-password"), false);
-    await authorizeRoom(env, room, principal.subject, "admin");
+    // Room password is enough to stop recording (cuts SFU adapter egress).
+    await authorizeRecordingAccess(request, env, room, url);
     return recordingBinding().fetch(
       new Request("https://recording.internal/finalize", { method: "POST" }),
     );
@@ -299,7 +311,125 @@ async function handleExtendedRoute(
     await authorizeRecordingAccess(request, env, room, url);
     return recordingBinding().fetch("https://recording.internal/download/audio");
   }
+
+  if (url.pathname === "/api/admin/purge-all" && request.method === "POST") {
+    assertSameOrigin(request);
+    return purgeAllRoomsAndRecordings(request, env);
+  }
+
   return undefined;
+}
+
+async function purgeAllRoomsAndRecordings(
+  request: Request,
+  env: ExtendedWorkerEnv,
+): Promise<Response> {
+  const expected = env.ROOM_CREATE_SECRET?.trim() ?? "";
+  const provided = (request.headers.get("x-room-create-secret") ?? "").trim();
+  if (!expected || !provided || !constantTimeEqual(expected, provided)) {
+    throw new RequestError(
+      403,
+      "room_create_forbidden",
+      "Purging rooms requires the host create key.",
+    );
+  }
+  if (!env.RECORDINGS || !env.ROOM_DO || !env.RECORDING_DO || !env.ROOMS) {
+    throw new RequestError(
+      503,
+      "purge_unavailable",
+      "Room or recording storage is not configured.",
+    );
+  }
+
+  let bodyRooms: string[] = [];
+  try {
+    const body = (await request.json()) as { rooms?: unknown };
+    if (Array.isArray(body.rooms)) {
+      bodyRooms = body.rooms.filter(
+        (item): item is string => typeof item === "string",
+      );
+    }
+  } catch {
+    // Empty body is fine — discover rooms from R2.
+  }
+
+  const roomIds = new Set<string>();
+  for (const raw of bodyRooms) {
+    const parsed = roomIdSchema.safeParse(raw.trim().toLowerCase());
+    if (parsed.success) roomIds.add(parsed.data);
+  }
+
+  // Empty the bound recordings bucket completely. Keep looping until the list
+  // is empty or we hit a wall-clock budget (Worker CPU/time limits used to
+  // stop early and leave large PCM dumps behind).
+  const deleteStarted = Date.now();
+  const DELETE_BUDGET_MS = 20_000;
+  let deletedObjects = 0;
+  let remainingObjects = 0;
+  let bucketClear = false;
+  for (;;) {
+    let cursor: string | undefined;
+    let batchDeleted = 0;
+    do {
+      const listed = await env.RECORDINGS.list({ cursor, limit: 1000 });
+      for (const object of listed.objects) {
+        const room = object.key.split("/")[0];
+        const parsed = roomIdSchema.safeParse(room);
+        if (parsed.success) roomIds.add(parsed.data);
+      }
+      if (listed.objects.length > 0) {
+        await env.RECORDINGS.delete(listed.objects.map((object) => object.key));
+        deletedObjects += listed.objects.length;
+        batchDeleted += listed.objects.length;
+      }
+      cursor = listed.truncated ? listed.cursor : undefined;
+      if (Date.now() - deleteStarted > DELETE_BUDGET_MS) break;
+    } while (cursor);
+
+    const check = await env.RECORDINGS.list({ limit: 1 });
+    remainingObjects = check.objects.length;
+    bucketClear = remainingObjects === 0 && !check.truncated;
+    if (bucketClear || batchDeleted === 0 || Date.now() - deleteStarted > DELETE_BUDGET_MS) {
+      break;
+    }
+  }
+
+  const purgedRooms: string[] = [];
+  const failures: Array<{ room: string; error: string }> = [];
+  for (const room of roomIds) {
+    try {
+      await Promise.all([
+        env.ROOM_DO.getByName(room).fetch(
+          new Request("https://room.internal/purge", { method: "POST" }),
+        ),
+        env.RECORDING_DO.getByName(room).fetch(
+          new Request("https://recording.internal/purge", { method: "POST" }),
+        ),
+        env.ROOMS.getByName(room).fetch(
+          new Request("https://video-room.internal/purge", { method: "POST" }),
+        ),
+      ]);
+      purgedRooms.push(room);
+    } catch (error) {
+      failures.push({
+        room,
+        error: error instanceof Error ? error.message : "purge failed",
+      });
+    }
+  }
+
+  return jsonResponse(
+    {
+      bucketClear,
+      deletedObjects,
+      failures,
+      ok: true as const,
+      purgedRooms,
+      remainingObjects,
+    },
+    200,
+    crypto.randomUUID(),
+  );
 }
 
 /** Password is enough after leave; guest ACL is only for passwordless rooms. */
@@ -402,8 +532,22 @@ async function checkRoomPassword(
   roomId: string,
   password: string | null | undefined,
   create: boolean,
+  createSecret?: string | null,
+  creatorSubject?: string | null,
 ): Promise<void> {
   if (env.ROOM_PASSWORD_REQUIRED !== "true") return;
+  if (create) {
+    const expected = env.ROOM_CREATE_SECRET?.trim() ?? "";
+    const provided =
+      typeof createSecret === "string" ? createSecret.trim() : "";
+    if (!expected || !provided || !constantTimeEqual(expected, provided)) {
+      throw new RequestError(
+        403,
+        "room_create_forbidden",
+        "Creating a room requires the host create key.",
+      );
+    }
+  }
   if (!env.ROOM_DO) {
     throw new RequestError(503, "room_password_unavailable", "Room password protection is not configured.");
   }
@@ -412,17 +556,34 @@ async function checkRoomPassword(
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ password: password ?? "", create }),
+      body: JSON.stringify({
+        password: password ?? "",
+        create,
+        ...(create && creatorSubject ? { creatorSubject } : {}),
+      }),
     },
   );
   if (response.ok) return;
   if (response.status === 409) {
-    throw new RequestError(409, "room_password_not_initialized", "This room has not been created yet. Create it first.");
+    throw new RequestError(
+      409,
+      "room_password_not_initialized",
+      "This room has not been created yet.",
+    );
   }
   if (response.status === 400) {
     throw new RequestError(400, "room_password_invalid", "Room password must be between 8 and 128 characters.");
   }
   throw new RequestError(401, "room_password_incorrect", "The room password is incorrect.");
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  let mismatch = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  }
+  return mismatch === 0;
 }
 
 function jsonRequest<S extends z.ZodType<Record<string, unknown>>>(

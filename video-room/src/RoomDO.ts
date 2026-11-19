@@ -4,10 +4,13 @@ type Role = "admin" | "participant";
 type Participant = {
   disconnectedAt?: number;
   displayName: string;
+  forceMuted: boolean;
   handRaised: boolean;
   id: string;
   joinedAt: number;
   media?: { sessionId: string; trackName: string };
+  /** SFU VideoRoom participant id — correlates mute UI with media tiles. */
+  mediaParticipantId?: string;
   muted: boolean;
   role: Role;
   sessions: Record<string, "publisher" | "subscriber">;
@@ -15,6 +18,9 @@ type Participant = {
   subject: string;
 };
 type RoomState = {
+  creatorSubject?: string | null;
+  /** After Mute all, late joiners start force-muted until host clears the latch. */
+  guestsForceMuted?: boolean;
   knownSubjects: string[];
   participants: Participant[];
   ended: boolean;
@@ -42,6 +48,11 @@ export class RoomDO extends DurableObject {
         (await ctx.storage.get<RoomState>("room")) ??
         { knownSubjects: [], participants: [], ended: false };
       this.state.knownSubjects ??= this.state.participants.map((item) => item.subject);
+      this.state.creatorSubject ??= null;
+      this.state.guestsForceMuted ??= false;
+      for (const item of this.state.participants) {
+        item.forceMuted ??= false;
+      }
     });
   }
 
@@ -69,13 +80,42 @@ export class RoomDO extends DurableObject {
     if (url.pathname === "/authorize-admin" && request.method === "POST") {
       return this.authorizeAdmin(request);
     }
+    if (url.pathname === "/purge" && request.method === "POST") {
+      return this.purge();
+    }
     return new Response("Not found", { status: 404 });
+  }
+
+  private async purge(): Promise<Response> {
+    return this.serial(async () => {
+      for (const socket of [...this.ctx.getWebSockets()]) {
+        try {
+          socket.close(4003, "Room purged.");
+        } catch {
+          // Best-effort.
+        }
+      }
+      await this.ctx.storage.deleteAll();
+      this.state = {
+        creatorSubject: null,
+        ended: false,
+        guestsForceMuted: false,
+        knownSubjects: [],
+        participants: [],
+      };
+      return Response.json({ ok: true });
+    });
   }
 
   async alarm(): Promise<void> {
     await this.ready;
     await this.serial(async () => {
       const now = Date.now();
+      if (this.state.ended && this.state.participants.length === 0) {
+        this.state.ended = false;
+        await this.persist();
+        return;
+      }
       const before = this.state.participants.length;
       this.state.participants = this.state.participants.filter((participant) => {
         if (!participant.disconnectedAt) return true;
@@ -97,6 +137,9 @@ export class RoomDO extends DurableObject {
         .map((value) => value + RECONNECT_GRACE_MS)
         .sort((a, b) => a - b)[0];
       if (nextExpiry) await this.ctx.storage.setAlarm(nextExpiry);
+      else if (this.state.ended && this.state.participants.length === 0) {
+        await this.ctx.storage.setAlarm(Date.now() + RECONNECT_GRACE_MS);
+      }
     });
   }
 
@@ -132,10 +175,28 @@ export class RoomDO extends DurableObject {
           DISPLAY_NAME.test(message.displayName.trim())
             ? message.displayName.trim()
             : "Guest";
+        // SFU room creator claims RoomDO sticky host so Mute all / End call authorize.
+        const claimHost = message.claimHost === true;
+        const latchMuted = Boolean(this.state.guestsForceMuted);
+        const mediaParticipantId =
+          typeof message.mediaParticipantId === "string" &&
+          /^p_[a-z0-9]{8,40}$/i.test(message.mediaParticipantId)
+            ? message.mediaParticipantId
+            : undefined;
 
         if (participant) {
           participant.displayName = displayName;
           participant.disconnectedAt = undefined;
+          if (mediaParticipantId) {
+            participant.mediaParticipantId = mediaParticipantId;
+          }
+          if (latchMuted && participant.role !== "admin") {
+            participant.muted = true;
+            participant.forceMuted = true;
+            participant.speaking = false;
+          }
+          if (claimHost) this.claimHost(participant);
+          else this.ensureLiveAdmin(participant);
           socket.serializeAttachment(attachment);
           await this.persist();
           this.broadcastState();
@@ -144,13 +205,13 @@ export class RoomDO extends DurableObject {
 
         const joined: Participant = {
           displayName,
+          forceMuted: latchMuted,
           handRaised: false,
           id: attachment.id,
           joinedAt: Date.now(),
-          muted: false,
-          role: this.state.participants.some((item) => item.role === "admin")
-            ? "participant"
-            : "admin",
+          mediaParticipantId,
+          muted: latchMuted,
+          role: "participant",
           sessions: {},
           speaking: false,
           subject: attachment.subject,
@@ -158,6 +219,15 @@ export class RoomDO extends DurableObject {
         this.state.participants.push(joined);
         if (!this.state.knownSubjects.includes(attachment.subject)) {
           this.state.knownSubjects.push(attachment.subject);
+        }
+        if (claimHost) {
+          this.claimHost(joined);
+        } else {
+          // First control-plane joiner becomes sticky host when unset.
+          if (!this.state.creatorSubject) {
+            this.state.creatorSubject = attachment.subject;
+          }
+          this.ensureLiveAdmin(joined);
         }
         socket.serializeAttachment(attachment);
         await this.persist();
@@ -178,8 +248,20 @@ export class RoomDO extends DurableObject {
           break;
         case "mute-status":
           if (typeof message.muted !== "boolean") return;
+          // Host force-mute locks the mic — correct the client instead of silent drop.
+          if (participant.forceMuted && message.muted === false) {
+            this.sendTo(participant.id, {
+              forceMuted: true,
+              muted: true,
+              participantId: participant.id,
+              type: "mute-status",
+            });
+            return;
+          }
           participant.muted = message.muted;
+          if (!message.muted) participant.forceMuted = false;
           this.broadcast({
+            forceMuted: participant.forceMuted,
             muted: participant.muted,
             participantId: participant.id,
             type: "mute-status",
@@ -227,26 +309,225 @@ export class RoomDO extends DurableObject {
           break;
         case "force-mute":
         case "force-unmute":
-          if (!this.isAdmin(participant)) return;
-          this.setForcedMute(message.participantId, message.type === "force-mute");
+          if (
+            !this.authorizeModeration(
+              participant,
+              message.claimHost === true,
+              socket,
+            )
+          ) {
+            this.sendTo(participant.id, {
+              code: "moderation_forbidden",
+              message: "Only the room host can mute participants.",
+              type: "error",
+            });
+            return;
+          }
+          if (
+            !this.setForcedMute(
+              message.participantId,
+              message.type === "force-mute",
+            )
+          ) {
+            this.sendTo(participant.id, {
+              code: "moderation_invalid",
+              message: "That participant is not available to mute.",
+              type: "error",
+            });
+            return;
+          }
+          if (message.type === "force-unmute") {
+            // Per-person unmute does not clear the room latch for late joiners.
+          }
+          break;
+        case "mute-all":
+          // claimHost on the action itself — join-time claim was racing SFU creator id.
+          if (
+            !this.authorizeModeration(
+              participant,
+              message.claimHost === true,
+              socket,
+            )
+          ) {
+            this.sendTo(participant.id, {
+              code: "moderation_forbidden",
+              message: "Only the room host can mute all.",
+              type: "error",
+            });
+            return;
+          }
+          {
+            this.state.guestsForceMuted = true;
+            let mutedCount = 0;
+            for (const other of this.state.participants) {
+              if (other.id === participant.id) continue;
+              other.muted = true;
+              other.forceMuted = true;
+              other.speaking = false;
+              mutedCount += 1;
+            }
+            // Room-wide event so every connected guest mutes immediately.
+            this.broadcast({
+              by: participant.id,
+              type: "mute-all",
+            });
+            for (const other of this.state.participants) {
+              if (other.id === participant.id) continue;
+              this.sendTo(other.id, {
+                force: true,
+                muted: true,
+                type: "force-mute",
+              });
+            }
+            this.sendTo(participant.id, {
+              count: mutedCount,
+              type: "mute-all-ok",
+            });
+            await this.persist();
+            this.broadcastState();
+          }
+          break;
+        case "unmute-all":
+          if (
+            !this.authorizeModeration(
+              participant,
+              message.claimHost === true,
+              socket,
+            )
+          ) {
+            this.sendTo(participant.id, {
+              code: "moderation_forbidden",
+              message: "Only the room host can unmute all.",
+              type: "error",
+            });
+            return;
+          }
+          {
+            this.state.guestsForceMuted = false;
+            let unmutedCount = 0;
+            for (const other of this.state.participants) {
+              if (other.id === participant.id) continue;
+              other.forceMuted = false;
+              other.muted = false;
+              unmutedCount += 1;
+              this.sendTo(other.id, {
+                force: true,
+                muted: false,
+                type: "force-unmute",
+              });
+            }
+            this.broadcast({
+              by: participant.id,
+              type: "unmute-all",
+            });
+            this.sendTo(participant.id, {
+              count: unmutedCount,
+              type: "unmute-all-ok",
+            });
+            await this.persist();
+            this.broadcastState();
+          }
           break;
         case "kick":
-          if (!this.isAdmin(participant) || typeof message.participantId !== "string") return;
-          if (message.participantId === participant.id) return;
-          this.kick(message.participantId);
+          if (
+            !this.authorizeModeration(
+              participant,
+              message.claimHost === true,
+              socket,
+            )
+          ) {
+            this.sendTo(participant.id, {
+              code: "moderation_forbidden",
+              message: "Only the room host can remove participants.",
+              type: "error",
+            });
+            return;
+          }
+          if (typeof message.participantId !== "string") {
+            this.sendTo(participant.id, {
+              code: "moderation_invalid",
+              message: "Pick a participant to remove.",
+              type: "error",
+            });
+            return;
+          }
+          if (message.participantId === participant.id) {
+            this.sendTo(participant.id, {
+              code: "moderation_invalid",
+              message: "You cannot remove yourself.",
+              type: "error",
+            });
+            return;
+          }
+          if (!this.kick(message.participantId)) {
+            this.sendTo(participant.id, {
+              code: "moderation_invalid",
+              message: "That participant is not available to remove.",
+              type: "error",
+            });
+            return;
+          }
           break;
         case "transfer-admin":
-          if (!this.isAdmin(participant) || typeof message.participantId !== "string") return;
-          this.transferAdmin(participant, message.participantId);
+          if (!this.canModerate(participant)) {
+            this.sendTo(participant.id, {
+              code: "moderation_forbidden",
+              message: "Only the room host can transfer host controls.",
+              type: "error",
+            });
+            return;
+          }
+          if (typeof message.participantId !== "string") {
+            this.sendTo(participant.id, {
+              code: "moderation_invalid",
+              message: "Pick a participant to make host.",
+              type: "error",
+            });
+            return;
+          }
+          if (!this.transferAdmin(participant, message.participantId)) {
+            this.sendTo(participant.id, {
+              code: "moderation_invalid",
+              message: "That participant is not available to make host.",
+              type: "error",
+            });
+            return;
+          }
+          this.sendTo(participant.id, {
+            participantId: message.participantId,
+            type: "transfer-admin-ok",
+          });
           break;
         case "end-call":
-          if (!this.isAdmin(participant)) return;
-          this.state.ended = true;
-          await this.persist();
-          this.broadcast({ type: "end-call" });
-          for (const client of this.ctx.getWebSockets()) {
-            client.close(1000, "Call ended.");
+          if (
+            !this.authorizeModeration(
+              participant,
+              message.claimHost === true,
+              socket,
+            )
+          ) {
+            this.sendTo(participant.id, {
+              code: "moderation_forbidden",
+              message: "Only the room host can end the call.",
+              type: "error",
+            });
+            return;
           }
+          this.state.guestsForceMuted = false;
+          this.state.ended = true;
+          this.state.participants = [];
+          await this.persist();
+          // Deliver end-call before closing so clients leave SFU instead of reconnecting.
+          this.broadcast({ type: "end-call" });
+          for (const client of [...this.ctx.getWebSockets()]) {
+            try {
+              client.close(4002, "Call ended.");
+            } catch {
+              // Best-effort close.
+            }
+          }
+          // Allow the same room URL to be reused after a short tombstone.
+          await this.ctx.storage.setAlarm(Date.now() + RECONNECT_GRACE_MS);
           break;
       }
       await this.persist();
@@ -268,6 +549,9 @@ export class RoomDO extends DurableObject {
         (item) => item.id === attachment.id,
       );
       if (!participant) return;
+      // A replaced socket's late close must not mark the new connection offline.
+      const current = this.socketFor(attachment.id);
+      if (current && current !== socket) return;
       // Keep membership briefly so brief network blips can reconnect.
       participant.disconnectedAt = Date.now();
       participant.speaking = false;
@@ -304,7 +588,11 @@ export class RoomDO extends DurableObject {
   }
 
   private async setOrVerifyPassword(request: Request): Promise<Response> {
-    let body: { password?: unknown; create?: unknown };
+    let body: {
+      create?: unknown;
+      creatorSubject?: unknown;
+      password?: unknown;
+    };
     try {
       body = await request.json();
     } catch {
@@ -314,6 +602,10 @@ export class RoomDO extends DurableObject {
       return new Response("A valid room password is required.", { status: 400 });
     }
     const password = body.password;
+    const creatorSubject =
+      typeof body.creatorSubject === "string" && body.creatorSubject.length > 0
+        ? body.creatorSubject
+        : null;
 
     return this.serial(async () => {
       if (!this.state.passwordHash) {
@@ -326,8 +618,18 @@ export class RoomDO extends DurableObject {
         const salt = crypto.getRandomValues(new Uint8Array(16));
         this.state.passwordSalt = bytesToHex(salt);
         this.state.passwordHash = await hashPassword(this.state.passwordSalt, password);
+        if (creatorSubject) this.state.creatorSubject = creatorSubject;
         await this.persist();
         return new Response(null, { status: 204 });
+      }
+
+      // Re-create with the host key re-claims sticky host (same room URL / new browser
+      // guest id used to leave creatorSubject pointing at a subject that never rejoins,
+      // so Mute all / End call never got an adminId).
+      if (body.create === true && creatorSubject) {
+        this.state.creatorSubject = creatorSubject;
+        this.state.ended = false;
+        await this.persist();
       }
 
       if (!password || !this.state.passwordSalt) {
@@ -407,64 +709,217 @@ export class RoomDO extends DurableObject {
     return Response.json({ ok: true });
   }
 
-  private setForcedMute(id: unknown, muted: boolean): void {
-    if (typeof id !== "string") return;
+  private setForcedMute(id: unknown, muted: boolean): boolean {
+    if (typeof id !== "string") return false;
     const participant = this.state.participants.find((item) => item.id === id);
-    if (!participant) return;
+    if (!participant) return false;
     participant.muted = muted;
+    participant.forceMuted = muted;
     participant.speaking = false;
-    this.sendTo(id, { muted, type: muted ? "force-mute" : "force-unmute" });
+    this.sendTo(id, {
+      force: true,
+      muted,
+      type: muted ? "force-mute" : "force-unmute",
+    });
     this.broadcast({
+      forceMuted: participant.forceMuted,
       muted,
       participantId: id,
       type: "mute-status",
     });
+    return true;
   }
 
-  private kick(id: string): void {
+  private kick(id: string): boolean {
     const participant = this.state.participants.find((item) => item.id === id);
-    if (!participant || participant.role === "admin") return;
+    if (!participant || participant.role === "admin") return false;
     this.sendTo(id, { type: "kicked" });
     const socket = this.socketFor(id);
     if (socket) socket.close(4001, "Removed from the room.");
     this.state.participants = this.state.participants.filter((item) => item.id !== id);
     this.broadcast({ participantId: id, type: "chime", sound: "leave" });
+    return true;
   }
 
-  private transferAdmin(current: Participant, id: string): void {
+  private claimHost(participant: Participant): void {
+    this.state.creatorSubject = participant.subject;
+    for (const item of this.state.participants) {
+      item.role = item.id === participant.id ? "admin" : "participant";
+    }
+  }
+
+  private transferAdmin(current: Participant, id: string): boolean {
     const target = this.state.participants.find((item) => item.id === id);
-    if (!target) return;
+    if (!target || target.id === current.id) return false;
     current.role = "participant";
     target.role = "admin";
+    // Sticky host must move with Make admin or ensureLiveAdmin undoes the transfer.
+    this.state.creatorSubject = target.subject;
+    return true;
   }
 
   private promoteNextAdmin(): void {
     const next = this.state.participants
       .slice()
       .sort((a, b) => a.joinedAt - b.joinedAt)[0];
-    if (next) next.role = "admin";
+    if (!next) return;
+    next.role = "admin";
+    // Grace expired and sticky row is gone — hand sticky host to the stand-in.
+    this.state.creatorSubject = next.subject;
+  }
+
+  private isLive(participant: Participant, via?: WebSocket): boolean {
+    if (via) {
+      const attachment = via.deserializeAttachment() as SocketAttachment | null;
+      if (attachment?.id === participant.id) return true;
+    }
+    return !participant.disconnectedAt && Boolean(this.socketFor(participant.id));
+  }
+
+  private inReconnectGrace(participant: Participant): boolean {
+    return (
+      typeof participant.disconnectedAt === "number" &&
+      Date.now() - participant.disconnectedAt < RECONNECT_GRACE_MS
+    );
+  }
+
+  /**
+   * Prefer a *live* sticky creator.
+   * - If sticky has not joined yet: nobody is admin (do not promote guests).
+   * - If sticky is in reconnect grace: optional live stand-in admin, but never
+   *   rewrite creatorSubject until the alarm drops the sticky row.
+   * - If sticky is live: they are the sole admin.
+   */
+  private ensureLiveAdmin(preferred?: Participant): void {
+    const sticky = this.state.creatorSubject
+      ? this.state.participants.find(
+          (item) => item.subject === this.state.creatorSubject,
+        )
+      : undefined;
+
+    if (sticky && this.isLive(sticky)) {
+      for (const item of this.state.participants) {
+        item.role = item.id === sticky.id ? "admin" : "participant";
+      }
+      return;
+    }
+
+    // Sticky subject not in the room yet — do not crown a guest. UI may still
+    // show controls via VideoRoom creator; canModerate stays false until sticky joins.
+    if (this.state.creatorSubject && !sticky) {
+      for (const item of this.state.participants) {
+        item.role = "participant";
+      }
+      return;
+    }
+
+    // Sticky still inside reconnect grace — temporary live admin only, keep sticky subject.
+    if (sticky && this.inReconnectGrace(sticky)) {
+      const liveAdmin = this.state.participants.find(
+        (item) => item.role === "admin" && this.isLive(item),
+      );
+      if (liveAdmin) return;
+      const next =
+        preferred && this.isLive(preferred) && preferred.id !== sticky.id
+          ? preferred
+          : this.state.participants.find(
+              (item) => this.isLive(item) && item.id !== sticky.id,
+            );
+      if (next) {
+        for (const item of this.state.participants) {
+          item.role = item.id === next.id ? "admin" : "participant";
+        }
+      }
+      return;
+    }
+
+    const liveAdmin = this.state.participants.find(
+      (item) => item.role === "admin" && this.isLive(item),
+    );
+    if (liveAdmin) {
+      if (!this.state.creatorSubject) {
+        this.state.creatorSubject = liveAdmin.subject;
+      }
+      return;
+    }
+
+    for (const item of this.state.participants) {
+      if (item.role === "admin") item.role = "participant";
+    }
+    const next =
+      preferred && this.isLive(preferred)
+        ? preferred
+        : this.state.participants.find((item) => this.isLive(item));
+    if (!next) return;
+    next.role = "admin";
+    if (!this.state.creatorSubject) {
+      this.state.creatorSubject = next.subject;
+    } else if (sticky && !this.inReconnectGrace(sticky) && !this.isLive(sticky)) {
+      // Grace already expired but row not filtered yet — allow sticky transfer.
+      this.state.creatorSubject = next.subject;
+    }
   }
 
   private isAdmin(participant: Participant): boolean {
     return participant.role === "admin";
   }
 
-  private socketFor(id: string): WebSocket | undefined {
-    return this.ctx.getWebSockets().find((socket) => {
+  private canModerate(participant: Participant): boolean {
+    return this.authorizeModeration(participant, false);
+  }
+
+  /**
+   * Mute all / End call must succeed for the live SFU creator. The client sends
+   * claimHost on those actions so a stale creatorSubject can never block them.
+   */
+  private authorizeModeration(
+    participant: Participant,
+    claimHost: boolean,
+    via?: WebSocket,
+  ): boolean {
+    if (!this.isLive(participant, via)) return false;
+    if (claimHost) {
+      this.claimHost(participant);
+      return true;
+    }
+    this.ensureLiveAdmin(participant);
+    if (this.isAdmin(participant)) return true;
+    return Boolean(
+      this.state.creatorSubject &&
+        participant.subject === this.state.creatorSubject,
+    );
+  }
+
+  private socketsFor(id: string): WebSocket[] {
+    return this.ctx.getWebSockets().filter((socket) => {
       const attachment = socket.deserializeAttachment() as SocketAttachment | null;
       return attachment?.id === id;
     });
   }
 
+  private socketFor(id: string): WebSocket | undefined {
+    return this.socketsFor(id)[0];
+  }
+
   private sendTo(id: string, message: unknown): void {
-    const socket = this.socketFor(id);
-    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+    const serialized = JSON.stringify(message);
+    for (const socket of this.socketsFor(id)) {
+      try {
+        socket.send(serialized);
+      } catch {
+        // Best-effort — one dead socket must not skip the guest.
+      }
+    }
   }
 
   private broadcast(message: unknown): void {
     const serialized = JSON.stringify(message);
     for (const socket of this.ctx.getWebSockets()) {
-      if (socket.readyState === WebSocket.OPEN) socket.send(serialized);
+      try {
+        socket.send(serialized);
+      } catch {
+        // Best-effort.
+      }
     }
   }
 
@@ -472,12 +927,20 @@ export class RoomDO extends DurableObject {
     for (const socket of this.ctx.getWebSockets()) {
       const attachment = socket.deserializeAttachment() as SocketAttachment | null;
       if (!attachment) continue;
-      socket.send(JSON.stringify({
-        adminId: this.state.participants.find((item) => item.role === "admin")?.id ?? null,
-        participants: this.state.participants.map(publicParticipant),
-        selfId: attachment.id,
-        type: "room-state",
-      }));
+      try {
+        socket.send(
+          JSON.stringify({
+            adminId:
+              this.state.participants.find((item) => item.role === "admin")?.id ??
+              null,
+            participants: this.state.participants.map(publicParticipant),
+            selfId: attachment.id,
+            type: "room-state",
+          }),
+        );
+      } catch {
+        // Best-effort.
+      }
     }
   }
 
@@ -496,9 +959,11 @@ function publicParticipant(participant: Participant) {
   return {
     disconnected: Boolean(participant.disconnectedAt),
     displayName: participant.displayName,
+    forceMuted: Boolean(participant.forceMuted),
     handRaised: participant.handRaised,
     id: participant.id,
     media: participant.media,
+    mediaParticipantId: participant.mediaParticipantId ?? null,
     muted: participant.muted,
     role: participant.role,
     speaking: participant.speaking,

@@ -11,6 +11,7 @@ import {
   type LifecycleTransitionContext,
 } from "./lifecycle";
 import { MediaSessions } from "./media";
+import { buildInviteUrl, passwordStorageKey } from "./ws-bootstrap";
 
 const MEDIA_DRAIN_TIMEOUT_MS = 1_000;
 const SETUP_ATTEMPTS = 3;
@@ -57,6 +58,11 @@ export function createRoomController() {
   let stopBackground: (() => void) | undefined;
   const streams = new Map<string, MediaStream>();
   const lifecycle = new ClientLifecycleController(handleLifecycleChange);
+  let unloadBound = false;
+  /** Desired mute for SFU senders — reapplied after every publish/reconnect. */
+  let micMutedDesired = false;
+
+  bindUnloadLeave();
 
   return {
     roomId,
@@ -74,6 +80,10 @@ export function createRoomController() {
     leave: leaveRoom,
     terminate: terminateRoom,
     copyLink,
+    setMicMuted(muted: boolean) {
+      micMutedDesired = muted;
+      activeRoom?.media?.setLocalAudioMuted(muted);
+    },
     resume() {
       if (
         sessionStorage.getItem("video-room-joined") === "true" &&
@@ -85,6 +95,42 @@ export function createRoomController() {
     },
   };
 
+  /** Tab close/refresh must release SFU sessions without waiting for stale timeout. */
+  function bindUnloadLeave(): void {
+    if (unloadBound || typeof window === "undefined") return;
+    unloadBound = true;
+    const onUnload = () => {
+      leaveBestEffortOnUnload();
+    };
+    window.addEventListener("pagehide", onUnload);
+    window.addEventListener("beforeunload", onUnload);
+  }
+
+  function leaveBestEffortOnUnload(): void {
+    const room = activeRoom;
+    if (!room) return;
+    stopBackgroundWork();
+    activeRoom = undefined;
+    try {
+      room.media?.close();
+    } catch {
+      // Page is tearing down.
+    }
+    for (const track of room.localStream.getTracks()) {
+      try {
+        track.stop();
+      } catch {
+        // Ignore.
+      }
+    }
+    streams.clear();
+    sessionStorage.removeItem("video-room-joined");
+    // Keep member token briefly so keepalive leave can authorize; clear pending.
+    sessionStorage.removeItem("video-room-pending-token");
+    room.api.leaveKeepalive();
+    sessionStorage.removeItem("video-room-token");
+  }
+
   function updateView(patch: Partial<RoomViewState>): void {
     view = { ...view, ...patch };
     for (const listener of listeners) listener();
@@ -94,13 +140,23 @@ export function createRoomController() {
     const generation = lifecycle.generation;
     const idleAtStart = lifecycle.active === undefined;
     try {
-      await navigator.clipboard.writeText(location.href);
+      const password = sessionStorage.getItem(passwordStorageKey(roomId));
+      const link =
+        password && password.length >= 8
+          ? buildInviteUrl(roomId, password)
+          : `${location.origin}/rooms/${roomId}`;
+      await navigator.clipboard.writeText(link);
       if (
         idleAtStart &&
         lifecycle.isCurrentGeneration(generation) &&
         lifecycle.active === undefined
       ) {
-        setStatus("Room link copied.", "ok");
+        setStatus(
+          password && password.length >= 8
+            ? "Invite link copied (includes room access)."
+            : "Room link copied. Add the room password for guests.",
+          "ok",
+        );
       }
     } catch (error) {
       if (idleAtStart && lifecycle.isCurrentGeneration(generation)) {
@@ -169,8 +225,12 @@ export function createRoomController() {
 
           if (!roomStream) {
             const acquired = await navigator.mediaDevices.getUserMedia({
-              audio: true,
-              video: { height: { ideal: 720 }, width: { ideal: 1280 } },
+              audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: false,
+              },
+              video: false,
             });
             if (!transition.isCurrent) {
               for (const track of acquired.getTracks()) track.stop();
@@ -254,6 +314,8 @@ export function createRoomController() {
             });
             await candidateMedia.publish();
             transition.throwIfSuperseded();
+            // Apply mute via silent keepalive after publish — never mid-reconnect refresh.
+            candidateMedia.setLocalAudioMuted(micMutedDesired);
             await candidateMedia.syncSubscriptions(
               joined.snapshot,
               joined.participantId,
@@ -269,6 +331,7 @@ export function createRoomController() {
               }
               pendingTracks.clear();
               replaced?.media?.close();
+              candidateMedia.setLocalAudioMuted(micMutedDesired);
               setStatus("Connected.", "ok");
             });
             return;
@@ -278,13 +341,14 @@ export function createRoomController() {
           }
         } catch (error) {
           transition.throwIfSuperseded();
-          if (
-            attempt + 1 >= SETUP_ATTEMPTS ||
-            !(error instanceof ApiError && error.retryable)
-          ) {
+          const canRetry =
+            error instanceof ApiError &&
+            (error.retryable || error.code === "media_generation_stale");
+          if (attempt + 1 >= SETUP_ATTEMPTS || !canRetry) {
             throw error;
           }
-          if (sessionEstablished) reconnectRequestId = lifecycleRequestId();
+          // Stale generation needs a new reconnect id so the server bumps sessions.
+          reconnectRequestId = lifecycleRequestId();
           await delayWithSignal(250 * 2 ** attempt, transition.signal);
         }
       }
@@ -311,8 +375,14 @@ export function createRoomController() {
         signal,
       );
     } catch (error) {
-      if (error instanceof ApiError && error.code === "member_token_invalid") {
+      if (
+        error instanceof ApiError &&
+        (error.code === "member_token_invalid" ||
+          error.code === "resume_required" ||
+          error.code === "client_mismatch")
+      ) {
         roomApi.memberToken = undefined;
+        sessionStorage.removeItem("video-room-token");
         return roomApi.join(
           currentClientId,
           displayName,
@@ -337,6 +407,20 @@ export function createRoomController() {
       });
     } catch (error) {
       if (isAbortError(error)) return;
+      // Stale generation is recovery, not a terminal failure — retry quietly.
+      if (
+        error instanceof ApiError &&
+        error.code === "media_generation_stale" &&
+        activeRoom === room
+      ) {
+        setStatus("Refreshing media session…", "warning");
+        window.setTimeout(() => {
+          if (activeRoom === room && lifecycle.active === undefined) {
+            void scheduleReconnect(room);
+          }
+        }, 300);
+        return;
+      }
       if (activeRoom === room) showError(error);
     }
   }
@@ -489,17 +573,37 @@ export function createRoomController() {
         lifecycle.active === undefined &&
         lifecycle.isCurrentGeneration(generation),
       onError(error) {
-        showError(error);
         if (
           error instanceof ApiError &&
           (error.retryable || error.code === "media_generation_stale")
         ) {
+          // Reconnect recovers stale SFU generations; avoid sticky error spam.
+          if (error.code === "media_generation_stale") {
+            setStatus("Refreshing media session…", "warning");
+          } else {
+            showError(error);
+          }
           void scheduleReconnect(room);
+          return;
         }
+        showError(error);
       },
       async onSnapshot(snapshot) {
+        if (activeRoom !== room || !room.media) return;
         showRoom(room, snapshot);
-        await room.media?.syncSubscriptions(snapshot, room.participantId);
+        try {
+          await room.media.syncSubscriptions(snapshot, room.participantId);
+        } catch (error) {
+          if (
+            error instanceof ApiError &&
+            error.code === "media_generation_stale"
+          ) {
+            setStatus("Refreshing media session…", "warning");
+            void scheduleReconnect(room);
+            return;
+          }
+          throw error;
+        }
       },
       onTerminated: () => void observeTermination(room),
     });
@@ -559,7 +663,7 @@ function setupStatus(
     return `Retrying room setup (${attempt + 1}/${SETUP_ATTEMPTS})...`;
   }
   if (transition === "reconnect") {
-    return "Connection interrupted. Reconnecting...";
+    return "Reconnecting media…";
   }
   return transition === "resume"
     ? "Rejoining the room..."
