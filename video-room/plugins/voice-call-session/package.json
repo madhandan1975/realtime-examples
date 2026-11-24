@@ -1,0 +1,40 @@
+{
+  "name": "voice-call-session",
+  "version": "0.1.0",
+  "description": "Keep Voice Room mic + playback alive while the screen is locked",
+  "main": "dist/plugin.cjs.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "unpkg": "dist/plugin.js",
+  "files": [
+    "android/src/main/",
+    "android/build.gradle",
+    "dist/",
+    "ios/Sources/",
+    "VoiceCallSession.podspec",
+    "Package.swift"
+  ],
+  "author": "Voice Room",
+  "license": "MIT",
+  "scripts": {
+    "build": "npm run clean && tsc",
+    "clean": "rimraf ./dist",
+    "watch": "tsc --watch"
+  },
+  "peerDependencies": {
+    "@capacitor/core": ">=6.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/core": "^8.6.2",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.9.3"
+  },
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    },
+    "android": {
+      "src": "android"
+    }
+  }
+}

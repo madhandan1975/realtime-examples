@@ -5,12 +5,17 @@ import type {
 } from "../shared/protocol";
 import { ApiError, RoomApi } from "./api";
 import { startRoomBackground } from "./background";
+import { setCallMediaSession } from "./call-media-session";
 import {
   ClientLifecycleController,
   type ClientLifecycleTransition,
   type LifecycleTransitionContext,
 } from "./lifecycle";
 import { MediaSessions } from "./media";
+import {
+  startVoiceCallSession,
+  stopVoiceCallSession,
+} from "./voice-call-session";
 import { buildInviteUrl, passwordStorageKey } from "./ws-bootstrap";
 
 const MEDIA_DRAIN_TIMEOUT_MS = 1_000;
@@ -59,10 +64,12 @@ export function createRoomController() {
   const streams = new Map<string, MediaStream>();
   const lifecycle = new ClientLifecycleController(handleLifecycleChange);
   let unloadBound = false;
+  let visibilityBound = false;
   /** Desired mute for SFU senders — reapplied after every publish/reconnect. */
   let micMutedDesired = false;
 
   bindUnloadLeave();
+  bindVisibilityResume();
 
   return {
     roomId,
@@ -106,11 +113,32 @@ export function createRoomController() {
     window.addEventListener("beforeunload", onUnload);
   }
 
+  /**
+   * After screen unlock / app foreground, reconnect if media or signaling died.
+   * Do not tear down tracks merely because the document was hidden.
+   */
+  function bindVisibilityResume(): void {
+    if (visibilityBound || typeof document === "undefined") return;
+    visibilityBound = true;
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible") return;
+      const room = activeRoom;
+      if (!room || lifecycle.active !== undefined) return;
+      const mediaDead = room.media?.needsReconnect?.() === true;
+      if (mediaDead) {
+        setStatus("Reconnecting after screen unlock…", "warning");
+        void scheduleReconnect(room);
+      }
+    });
+  }
+
   function leaveBestEffortOnUnload(): void {
     const room = activeRoom;
     if (!room) return;
     stopBackgroundWork();
     activeRoom = undefined;
+    setCallMediaSession(false);
+    void stopVoiceCallSession();
     try {
       room.media?.close();
     } catch {
@@ -136,14 +164,14 @@ export function createRoomController() {
     for (const listener of listeners) listener();
   }
 
-  async function copyLink(): Promise<void> {
+  async function copyLink(listenOnly = false): Promise<void> {
     const generation = lifecycle.generation;
     const idleAtStart = lifecycle.active === undefined;
     try {
       const password = sessionStorage.getItem(passwordStorageKey(roomId));
       const link =
         password && password.length >= 8
-          ? buildInviteUrl(roomId, password)
+          ? buildInviteUrl(roomId, password, { listenOnly })
           : `${location.origin}/rooms/${roomId}`;
       await navigator.clipboard.writeText(link);
       if (
@@ -153,7 +181,9 @@ export function createRoomController() {
       ) {
         setStatus(
           password && password.length >= 8
-            ? "Invite link copied (includes room access)."
+            ? listenOnly
+              ? "Listener invite copied (guests join muted)."
+              : "Speaker invite copied (includes room access)."
             : "Room link copied. Add the room password for guests.",
           "ok",
         );
@@ -333,6 +363,8 @@ export function createRoomController() {
               replaced?.media?.close();
               candidateMedia.setLocalAudioMuted(micMutedDesired);
               setStatus("Connected.", "ok");
+              void startVoiceCallSession(roomId, "Voice Room");
+              setCallMediaSession(true, roomId);
             });
             return;
           } finally {
@@ -619,6 +651,8 @@ export function createRoomController() {
     if (activeRoom !== room) return;
     stopBackgroundWork();
     activeRoom = undefined;
+    setCallMediaSession(false);
+    void stopVoiceCallSession();
     room.media?.close();
     sessionStorage.removeItem("video-room-token");
     sessionStorage.removeItem("video-room-pending-token");

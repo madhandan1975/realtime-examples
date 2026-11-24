@@ -20,6 +20,24 @@ type RecordingStatus = {
   tracks?: number;
 };
 
+type AdminRecordingRow = {
+  bytes: number;
+  downloadFilename: string | null;
+  downloadable: boolean;
+  expiresAt: number | null;
+  format: "ogg/opus" | "pcm/wav" | "unknown";
+  hasManifest: boolean;
+  hasOgg: boolean;
+  lastError: string | null;
+  modifiedAt: string | null;
+  objectCount: number;
+  pcmChunks: number;
+  recordingId: string;
+  roomId: string;
+  startedAt: number | null;
+  status: string | null;
+};
+
 type PurgeResult = {
   bucketClear?: boolean;
   deletedObjects?: number;
@@ -32,14 +50,41 @@ type PurgeResult = {
 
 function recordingDownloadFilename(status: RecordingStatus): string {
   if (status.downloadFilename) return status.downloadFilename;
+  const ext = status.format === "ogg/opus" ? "ogg" : "wav";
   if (status.startedAt) {
     const date = new Date(status.startedAt);
     const y = date.getUTCFullYear();
     const m = String(date.getUTCMonth() + 1).padStart(2, "0");
     const d = String(date.getUTCDate()).padStart(2, "0");
-    return `${y}-${m}-${d}.ogg`;
+    return `${y}-${m}-${d}.${ext}`;
   }
-  return "recording.ogg";
+  return `recording.${ext}`;
+}
+
+function adminRowFilename(row: AdminRecordingRow): string {
+  if (row.downloadFilename) return row.downloadFilename;
+  const ext = row.format === "ogg/opus" ? "ogg" : "wav";
+  if (row.startedAt) {
+    const date = new Date(row.startedAt);
+    const y = date.getUTCFullYear();
+    const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(date.getUTCDate()).padStart(2, "0");
+    return `${row.roomId}-${y}-${m}-${d}.${ext}`;
+  }
+  return `${row.roomId}-${row.recordingId.slice(0, 8)}.${ext}`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1000) return `${bytes} B`;
+  if (bytes < 1_000_000) return `${(bytes / 1000).toFixed(1)} KB`;
+  return `${(bytes / 1_000_000).toFixed(1)} MB`;
+}
+
+function formatWhen(value: number | string | null): string {
+  if (value == null) return "—";
+  const date = typeof value === "number" ? new Date(value) : new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleString();
 }
 
 const ROOM_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -74,9 +119,17 @@ export function AdminPortal() {
   const [createSecret, setCreateSecret] = useState("");
   const [extraRooms, setExtraRooms] = useState("");
   const [status, setStatus] = useState<RecordingStatus | null>(null);
+  const [recordings, setRecordings] = useState<AdminRecordingRow[]>([]);
   const [busy, setBusy] = useState(false);
+  const [listBusy, setListBusy] = useState(false);
   const [message, setMessage] = useState(
     "Enter a room name and its password to look up the recording.",
+  );
+  const [listMessage, setListMessage] = useState(
+    "Enter the host create key, then refresh to list every take in R2.",
+  );
+  const [endCallMessage, setEndCallMessage] = useState(
+    "Stop a live room without rejoining: room name + password + host create key.",
   );
   const [purgeMessage, setPurgeMessage] = useState(
     "Wipe every recording in R2 and reset known room Durable Objects. Requires the host create key.",
@@ -171,6 +224,206 @@ export function AdminPortal() {
     }
   };
 
+  const refreshList = async () => {
+    const secret = createSecret.trim();
+    if (!secret) {
+      setListMessage("Enter the host create key to list recordings.");
+      return;
+    }
+    setListBusy(true);
+    setListMessage("Loading recordings from R2…");
+    try {
+      const response = await fetch("/api/admin/recordings", {
+        credentials: "same-origin",
+        headers: { "x-room-create-secret": secret },
+      });
+      const payload = (await response.json().catch(() => null)) as {
+        count?: number;
+        recordings?: AdminRecordingRow[];
+        error?: { message?: string };
+      } | null;
+      if (!response.ok) {
+        setRecordings([]);
+        setListMessage(
+          payload?.error?.message ?? `List failed (${response.status}).`,
+        );
+        return;
+      }
+      const rows = payload?.recordings ?? [];
+      setRecordings(rows);
+      setListMessage(
+        rows.length === 0
+          ? "No recordings found in the bucket."
+          : `Found ${rows.length} recording${rows.length === 1 ? "" : "s"}.`,
+      );
+    } catch {
+      setRecordings([]);
+      setListMessage("Could not reach the recordings list endpoint.");
+    } finally {
+      setListBusy(false);
+    }
+  };
+
+  const downloadListed = async (row: AdminRecordingRow) => {
+    const secret = createSecret.trim();
+    if (!secret) {
+      setListMessage("Enter the host create key to download.");
+      return;
+    }
+    setListBusy(true);
+    setListMessage(`Preparing ${row.roomId}…`);
+    try {
+      const response = await fetch(
+        `/api/admin/recordings/download?room=${encodeURIComponent(row.roomId)}&recordingId=${encodeURIComponent(row.recordingId)}`,
+        {
+          credentials: "same-origin",
+          headers: { "x-room-create-secret": secret },
+        },
+      );
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as {
+          error?: { message?: string };
+        } | null;
+        setListMessage(
+          payload?.error?.message ??
+            `Download failed for ${row.roomId} (${response.status}).`,
+        );
+        return;
+      }
+      const objectUrl = URL.createObjectURL(await response.blob());
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = adminRowFilename(row);
+      anchor.click();
+      URL.revokeObjectURL(objectUrl);
+      setListMessage(`Download started for ${row.roomId}.`);
+    } catch {
+      setListMessage(`Download failed for ${row.roomId}.`);
+    } finally {
+      setListBusy(false);
+    }
+  };
+
+  const deleteListed = async (row: AdminRecordingRow) => {
+    const secret = createSecret.trim();
+    if (!secret) {
+      setListMessage("Enter the host create key to delete.");
+      return;
+    }
+    if (
+      !confirm(
+        `Delete recording for room "${row.roomId}" (${row.recordingId.slice(0, 8)}…)? This removes it from R2 and cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    setListBusy(true);
+    setListMessage(`Deleting ${row.roomId}…`);
+    try {
+      const response = await fetch("/api/admin/recordings/delete", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "content-type": "application/json",
+          "x-room-create-secret": secret,
+        },
+        body: JSON.stringify({
+          room: row.roomId,
+          recordingId: row.recordingId,
+        }),
+      });
+      const payload = (await response.json().catch(() => null)) as {
+        deletedObjects?: number;
+        error?: { message?: string };
+        ok?: boolean;
+      } | null;
+      if (!response.ok) {
+        setListMessage(
+          payload?.error?.message ??
+            `Delete failed for ${row.roomId} (${response.status}).`,
+        );
+        return;
+      }
+      setRecordings((current) =>
+        current.filter(
+          (item) =>
+            !(
+              item.roomId === row.roomId &&
+              item.recordingId === row.recordingId
+            ),
+        ),
+      );
+      if (
+        status?.recordingId &&
+        status.recordingId === row.recordingId &&
+        roomId.trim().toLowerCase() === row.roomId
+      ) {
+        setStatus(null);
+      }
+      setListMessage(
+        `Deleted ${row.roomId} (${payload?.deletedObjects ?? 0} object(s)).`,
+      );
+    } catch {
+      setListMessage(`Delete failed for ${row.roomId}.`);
+    } finally {
+      setListBusy(false);
+    }
+  };
+
+  const endLiveCall = async () => {
+    const room = roomId.trim().toLowerCase();
+    const secret = createSecret.trim();
+    if (!ROOM_ID.test(room)) {
+      setEndCallMessage("Enter a valid room name above.");
+      return;
+    }
+    if (password.length < 8) {
+      setEndCallMessage("Enter the room password above.");
+      return;
+    }
+    if (!secret) {
+      setEndCallMessage("Enter the host create key to end a live call.");
+      return;
+    }
+    if (
+      !confirm(
+        `End the live call for everyone in "${room}" and stop recording? Guests will be disconnected.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setEndCallMessage("Ending live call…");
+    try {
+      const response = await fetch("/api/admin/end-call", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "content-type": "application/json",
+          "x-room-create-secret": secret,
+        },
+        body: JSON.stringify({ room, password }),
+      });
+      const payload = (await response.json().catch(() => null)) as {
+        error?: { message?: string };
+        ok?: boolean;
+      } | null;
+      if (!response.ok) {
+        setEndCallMessage(
+          payload?.error?.message ?? `End call failed (${response.status}).`,
+        );
+        return;
+      }
+      setEndCallMessage(
+        `Live call ended for ${room}. Guests were disconnected and recording finalize was requested.`,
+      );
+    } catch {
+      setEndCallMessage("Could not reach the end-call endpoint.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const purgeAll = async () => {
     const secret = createSecret.trim();
     if (!secret) {
@@ -212,6 +465,7 @@ export function AdminPortal() {
       }
       clearRoomSessionData(payload?.purgedRooms ?? rooms);
       setStatus(null);
+      setRecordings([]);
       const purged = payload?.purgedRooms?.length ?? 0;
       const objects = payload?.deletedObjects ?? 0;
       const failed = payload?.failures?.length ?? 0;
@@ -225,6 +479,7 @@ export function AdminPortal() {
             : `Recordings bucket is empty (${objects} deleted). Reset ${purged} room(s). You can create a fresh room now.`,
       );
       setMessage("Lookup state cleared after purge.");
+      setListMessage("Recording list cleared after purge.");
     } catch {
       setPurgeMessage("Could not reach the purge endpoint.");
     } finally {
@@ -233,7 +488,7 @@ export function AdminPortal() {
   };
 
   return (
-    <div className="mx-auto max-w-lg px-4 py-10 sm:px-6">
+    <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6">
       <header className="mb-6">
         <p className="text-sm font-medium text-orange-800">
           <a className="hover:underline" href="/">
@@ -246,8 +501,9 @@ export function AdminPortal() {
           Recording admin
         </h1>
         <p className="mt-2 text-sm leading-6 text-stone-600">
-          Look up a room by name and password, then download the OGG Opus recording.
-          Recordings are deleted automatically after 7 days.
+          Look up a room by password, list every take in R2 with the host create
+          key, and download OGG or WAV. Recordings are deleted automatically
+          after 7 days.
         </p>
       </header>
 
@@ -258,7 +514,8 @@ export function AdminPortal() {
           void lookup();
         }}
       >
-        <label className="block text-sm font-medium text-stone-800" htmlFor="admin-room">
+        <h2 className="text-base font-semibold text-stone-900">Room lookup</h2>
+        <label className="mt-4 block text-sm font-medium text-stone-800" htmlFor="admin-room">
           Room name
         </label>
         <input
@@ -289,14 +546,14 @@ export function AdminPortal() {
         <div className="mt-5 flex flex-wrap gap-2">
           <button
             className="inline-flex min-h-11 cursor-pointer items-center rounded-lg bg-orange-700 px-4 py-2 text-sm font-semibold text-white enabled:hover:bg-orange-800 disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={busy}
+            disabled={busy || listBusy}
             type="submit"
           >
             Look up
           </button>
           <button
             className="inline-flex min-h-11 cursor-pointer items-center rounded-lg border border-stone-300 bg-white px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={busy || !status?.downloadable}
+            disabled={busy || listBusy || !status?.downloadable}
             onClick={() => void download()}
             type="button"
           >
@@ -361,6 +618,143 @@ export function AdminPortal() {
         </dl>
       )}
 
+      <section className="mt-8 rounded-xl border border-amber-200 bg-amber-50 p-5">
+        <h2 className="text-base font-semibold text-amber-950">
+          End live call
+        </h2>
+        <p className="mt-2 text-sm leading-6 text-amber-950/80">
+          Use this when the host closed the browser and cannot rejoin. Uses the
+          room name and password from the lookup form plus the host create key.
+          Same effect as in-room End call: disconnect everyone and finalize
+          recording.
+        </p>
+        <button
+          className="mt-4 inline-flex min-h-11 cursor-pointer items-center rounded-lg bg-amber-800 px-4 py-2 text-sm font-semibold text-white enabled:hover:bg-amber-900 disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={busy || listBusy}
+          onClick={() => void endLiveCall()}
+          type="button"
+        >
+          End live call for room
+        </button>
+        <p className="mt-3 text-sm text-amber-950" role="status">
+          {endCallMessage}
+        </p>
+      </section>
+
+      <section className="mt-8 rounded-xl border border-stone-200 bg-white p-5 shadow-sm">
+        <h2 className="text-base font-semibold text-stone-900">
+          All recordings
+        </h2>
+        <p className="mt-2 text-sm leading-6 text-stone-600">
+          Lists every room/recording take stored in the recordings bucket.
+          Requires the host create key (same as purge).
+        </p>
+
+        <label
+          className="mt-4 block text-sm font-medium text-stone-800"
+          htmlFor="admin-list-secret"
+        >
+          Host create key
+        </label>
+        <input
+          id="admin-list-secret"
+          autoComplete="off"
+          className="mt-1.5 w-full rounded-lg border border-stone-300 px-3 py-2.5 text-sm"
+          placeholder="ROOM_CREATE_SECRET"
+          type="password"
+          value={createSecret}
+          onChange={(event) => setCreateSecret(event.target.value)}
+        />
+
+        <button
+          className="mt-4 inline-flex min-h-11 cursor-pointer items-center rounded-lg bg-stone-900 px-4 py-2 text-sm font-semibold text-white enabled:hover:bg-stone-800 disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={busy || listBusy}
+          onClick={() => void refreshList()}
+          type="button"
+        >
+          Refresh list
+        </button>
+
+        <p className="mt-3 text-sm text-stone-700" role="status">
+          {listMessage}
+        </p>
+
+        {recordings.length > 0 && (
+          <div className="mt-4 overflow-x-auto rounded-lg border border-stone-200">
+            <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
+              <thead className="bg-stone-50 text-stone-600">
+                <tr>
+                  <th className="px-3 py-2 font-medium">Room</th>
+                  <th className="px-3 py-2 font-medium">Started</th>
+                  <th className="px-3 py-2 font-medium">Size</th>
+                  <th className="px-3 py-2 font-medium">Format</th>
+                  <th className="px-3 py-2 font-medium">Status</th>
+                  <th className="px-3 py-2 font-medium"> </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-stone-100 bg-white">
+                {recordings.map((row) => (
+                  <tr key={`${row.roomId}/${row.recordingId}`}>
+                    <td className="px-3 py-2 align-top">
+                      <div className="font-medium text-stone-900">{row.roomId}</div>
+                      <div className="truncate text-xs text-stone-500" title={row.recordingId}>
+                        {row.recordingId.slice(0, 8)}…
+                      </div>
+                    </td>
+                    <td className="px-3 py-2 align-top text-stone-800">
+                      {formatWhen(row.startedAt ?? row.modifiedAt)}
+                    </td>
+                    <td className="px-3 py-2 align-top text-stone-800">
+                      {formatBytes(row.bytes)}
+                      {row.pcmChunks > 0 ? (
+                        <div className="text-xs text-stone-500">
+                          {row.pcmChunks} PCM
+                        </div>
+                      ) : null}
+                    </td>
+                    <td className="px-3 py-2 align-top text-stone-800">
+                      {row.format === "ogg/opus"
+                        ? "OGG"
+                        : row.format === "pcm/wav"
+                          ? "WAV"
+                          : "—"}
+                    </td>
+                    <td className="px-3 py-2 align-top text-stone-800">
+                      {row.status ?? "—"}
+                      {row.lastError ? (
+                        <div className="max-w-[14rem] text-xs text-red-700">
+                          {row.lastError}
+                        </div>
+                      ) : null}
+                    </td>
+                    <td className="px-3 py-2 align-top">
+                      <div className="flex flex-wrap gap-1.5">
+                        <button
+                          className="inline-flex min-h-9 cursor-pointer items-center rounded-md border border-stone-300 bg-white px-3 py-1.5 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled={busy || listBusy || !row.downloadable}
+                          onClick={() => void downloadListed(row)}
+                          type="button"
+                        >
+                          Download
+                        </button>
+                        <button
+                          className="inline-flex min-h-9 cursor-pointer items-center rounded-md border border-red-200 bg-red-50 px-3 py-1.5 text-xs font-medium text-red-800 disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled={busy || listBusy}
+                          onClick={() => void deleteListed(row)}
+                          type="button"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
       <section className="mt-8 rounded-xl border border-red-200 bg-red-50 p-5">
         <h2 className="text-base font-semibold text-red-900">
           Delete all rooms &amp; recordings
@@ -368,24 +762,8 @@ export function AdminPortal() {
         <p className="mt-2 text-sm leading-6 text-red-900/80">
           Removes every object in the recordings bucket and resets RoomDO,
           RecordingDO, and VideoRoom for rooms found in R2 plus any rooms listed
-          below or remembered in this browser.
+          below or remembered in this browser. Uses the host create key above.
         </p>
-
-        <label
-          className="mt-4 block text-sm font-medium text-red-950"
-          htmlFor="admin-create-secret"
-        >
-          Host create key
-        </label>
-        <input
-          id="admin-create-secret"
-          autoComplete="off"
-          className="mt-1.5 w-full rounded-lg border border-red-200 bg-white px-3 py-2.5 text-sm"
-          placeholder="ROOM_CREATE_SECRET"
-          type="password"
-          value={createSecret}
-          onChange={(event) => setCreateSecret(event.target.value)}
-        />
 
         <label
           className="mt-4 block text-sm font-medium text-red-950"
@@ -404,7 +782,7 @@ export function AdminPortal() {
 
         <button
           className="mt-5 inline-flex min-h-11 cursor-pointer items-center rounded-lg bg-red-700 px-4 py-2 text-sm font-semibold text-white enabled:hover:bg-red-800 disabled:cursor-not-allowed disabled:opacity-50"
-          disabled={busy}
+          disabled={busy || listBusy}
           onClick={() => void purgeAll()}
           type="button"
         >

@@ -83,7 +83,34 @@ export class RoomDO extends DurableObject {
     if (url.pathname === "/purge" && request.method === "POST") {
       return this.purge();
     }
+    if (url.pathname === "/admin-end-call" && request.method === "POST") {
+      return this.adminEndCall();
+    }
     return new Response("Not found", { status: 404 });
+  }
+
+  /** Worker/admin path: end the live call without a host WebSocket tab. */
+  private async adminEndCall(): Promise<Response> {
+    return this.serial(async () => {
+      await this.endCallForEveryone();
+      return Response.json({ ok: true as const, ended: true });
+    });
+  }
+
+  private async endCallForEveryone(): Promise<void> {
+    this.state.guestsForceMuted = false;
+    this.state.ended = true;
+    this.state.participants = [];
+    await this.persist();
+    this.broadcast({ type: "end-call" });
+    for (const client of [...this.ctx.getWebSockets()]) {
+      try {
+        client.close(4002, "Call ended.");
+      } catch {
+        // Best-effort close.
+      }
+    }
+    await this.ctx.storage.setAlarm(Date.now() + RECONNECT_GRACE_MS);
   }
 
   private async purge(): Promise<Response> {
@@ -177,7 +204,8 @@ export class RoomDO extends DurableObject {
             : "Guest";
         // SFU room creator claims RoomDO sticky host so Mute all / End call authorize.
         const claimHost = message.claimHost === true;
-        const latchMuted = Boolean(this.state.guestsForceMuted);
+        const listenOnly = message.listenOnly === true;
+        const latchMuted = Boolean(this.state.guestsForceMuted) || listenOnly;
         const mediaParticipantId =
           typeof message.mediaParticipantId === "string" &&
           /^p_[a-z0-9]{8,40}$/i.test(message.mediaParticipantId)
@@ -200,6 +228,13 @@ export class RoomDO extends DurableObject {
           socket.serializeAttachment(attachment);
           await this.persist();
           this.broadcastState();
+          if (latchMuted && participant.role !== "admin") {
+            this.sendTo(participant.id, {
+              force: true,
+              muted: true,
+              type: "force-mute",
+            });
+          }
           return;
         }
 
@@ -233,6 +268,13 @@ export class RoomDO extends DurableObject {
         await this.persist();
         this.broadcast({ type: "chime", sound: "join" });
         this.broadcastState();
+        if (latchMuted && joined.role !== "admin") {
+          this.sendTo(joined.id, {
+            force: true,
+            muted: true,
+            type: "force-mute",
+          });
+        }
         return;
       }
       if (!participant) {
@@ -469,7 +511,13 @@ export class RoomDO extends DurableObject {
           }
           break;
         case "transfer-admin":
-          if (!this.canModerate(participant)) {
+          if (
+            !this.authorizeModeration(
+              participant,
+              message.claimHost === true,
+              socket,
+            )
+          ) {
             this.sendTo(participant.id, {
               code: "moderation_forbidden",
               message: "Only the room host can transfer host controls.",
@@ -513,22 +561,8 @@ export class RoomDO extends DurableObject {
             });
             return;
           }
-          this.state.guestsForceMuted = false;
-          this.state.ended = true;
-          this.state.participants = [];
-          await this.persist();
-          // Deliver end-call before closing so clients leave SFU instead of reconnecting.
-          this.broadcast({ type: "end-call" });
-          for (const client of [...this.ctx.getWebSockets()]) {
-            try {
-              client.close(4002, "Call ended.");
-            } catch {
-              // Best-effort close.
-            }
-          }
-          // Allow the same room URL to be reused after a short tombstone.
-          await this.ctx.storage.setAlarm(Date.now() + RECONNECT_GRACE_MS);
-          break;
+          await this.endCallForEveryone();
+          return;
       }
       await this.persist();
       this.broadcastState();

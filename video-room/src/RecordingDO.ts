@@ -65,6 +65,12 @@ const SAMPLE_RATE = 48_000;
 const MAX_PENDING_BYTES = 4_000_000;
 /** Match Cloudflare Realtime SFU WebSocket egress reconnect+buffer window. */
 const SFU_ADAPTER_RECONNECT_MS = 15_000;
+/**
+ * In-Worker Opus of a full take OOMs / hits DO CPU limits on long calls.
+ * Above this PCM size we keep a downloadable WAV instead of failing the recording.
+ * ~12 MB stereo Int16 @ 48 kHz ≈ 1 minute.
+ */
+const OPUS_MAX_PCM_BYTES = 12 * 1024 * 1024;
 
 export class RecordingDO extends DurableObject<RecordingEnvironment> {
   private state: RecordingState = emptyState("");
@@ -108,6 +114,7 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
       return this.syncTracks(request);
     }
     if (url.pathname === "/status" && request.method === "GET") {
+      await this.healDownloadableFromR2();
       return Response.json(this.publicStatus());
     }
     if (url.pathname === "/finalize" && request.method === "POST") {
@@ -122,7 +129,50 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
     if (url.pathname === "/purge" && request.method === "POST") {
       return this.purge();
     }
+    if (url.pathname === "/forget-take" && request.method === "POST") {
+      return this.forgetTake(request);
+    }
     return new Response("Not found", { status: 404 });
+  }
+
+  /** Clear DO state when admin deletes the take that this DO currently owns. */
+  private async forgetTake(request: Request): Promise<Response> {
+    return this.serial(async () => {
+      let recordingId = "";
+      try {
+        const body = (await request.json()) as { recordingId?: unknown };
+        recordingId =
+          typeof body.recordingId === "string" ? body.recordingId.trim() : "";
+      } catch {
+        return new Response("Invalid JSON", { status: 400 });
+      }
+      if (!recordingId || this.state.recordingId !== recordingId) {
+        return Response.json({
+          ok: true as const,
+          cleared: false,
+          recordingId: this.state.recordingId || null,
+        });
+      }
+      if (this.state.status === "recording" || this.state.status === "finalizing") {
+        for (const adapter of this.state.adapters) {
+          await new RealtimeSfuClient(this.env)
+            .closeWebSocketAdapter(adapter.adapterId)
+            .catch(() => undefined);
+        }
+      }
+      this.pendingByTrack.clear();
+      this.pendingSamples = 0;
+      const roomId = this.state.roomId || (this.ctx.id.name ?? "");
+      this.state = emptyState(roomId);
+      await this.persist();
+      await this.ctx.storage.deleteAlarm();
+      this.broadcastStatus();
+      return Response.json({
+        ok: true as const,
+        cleared: true,
+        recordingId,
+      });
+    });
   }
 
   private async purge(): Promise<Response> {
@@ -516,16 +566,27 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
 
     this.state.finalized = true;
     if (this.state.chunks.length > 0) {
-      try {
-        await this.encodeAndStoreOgg();
-        this.state.status = "ready";
-        this.state.lastError = null;
-      } catch (error) {
-        this.state.status = "failed";
-        this.state.lastError =
-          error instanceof Error
-            ? `Opus encode failed: ${error.message}`
-            : "Opus encode failed.";
+      const pcmBytes = this.state.chunks.reduce(
+        (sum, chunk) => sum + chunk.bytes,
+        0,
+      );
+      if (pcmBytes <= OPUS_MAX_PCM_BYTES) {
+        try {
+          await this.encodeAndStoreOgg();
+          this.state.status = "ready";
+          this.state.lastError = null;
+        } catch (error) {
+          // Never mark a take with stored PCM as failed — WAV remains downloadable.
+          this.markWavReady(
+            error instanceof Error
+              ? `Opus encode failed (${error.message}); WAV download available.`
+              : "Opus encode failed; WAV download available.",
+          );
+        }
+      } else {
+        this.markWavReady(
+          `Recording too long for in-Worker Opus (${Math.round(pcmBytes / 1_000_000)} MB PCM); WAV download available.`,
+        );
       }
     } else if (this.state.downloadKey) {
       this.state.status = "ready";
@@ -582,6 +643,17 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
     this.state.downloadFilename = downloadFilename;
     this.state.downloadKey = downloadKey;
     this.state.format = "ogg/opus";
+  }
+
+  /** Keep PCM chunks and mark the take downloadable as WAV. */
+  private markWavReady(note: string | null): void {
+    this.state.status = "ready";
+    this.state.format = "pcm/wav";
+    this.state.downloadKey = null;
+    this.state.downloadFilename = null;
+    this.state.bitrateKbps = null;
+    this.state.channels = 2;
+    this.state.lastError = note;
   }
 
   private async purgeExpired(): Promise<void> {
@@ -652,6 +724,22 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
       return new Response("Recording expired and was deleted.", { status: 410 });
     }
 
+    // Heal stranded takes: Opus failure used to leave status=failed with PCM intact.
+    if (
+      this.state.status === "failed" &&
+      this.state.chunks.length > 0 &&
+      !this.state.downloadKey
+    ) {
+      this.markWavReady(
+        this.state.lastError ??
+          "Recovered stranded PCM as WAV after a prior encode failure.",
+      );
+      this.state.finalized = true;
+      this.state.expiresAt ??= Date.now() + RETENTION_MS;
+      await this.writeManifest("recover-wav");
+      await this.persist();
+    }
+
     const downloadKey = this.state.downloadKey;
     if (downloadKey) {
       return this.streamOgg(
@@ -665,35 +753,125 @@ export class RecordingDO extends DurableObject<RecordingEnvironment> {
       const latest = await this.env.RECORDINGS.get(
         `${this.state.roomId}/latest-manifest.json`,
       );
-      if (!latest) return new Response("Recording not found.", { status: 404 });
-      const parsed = (await latest.json()) as {
-        chunks?: typeof chunks;
-        downloadFilename?: string | null;
-        downloadKey?: string | null;
-        expiresAt?: number | null;
-        startedAt?: number;
-      };
-      if (
-        typeof parsed.expiresAt === "number" &&
-        parsed.expiresAt <= Date.now()
-      ) {
-        return new Response("Recording expired and was deleted.", {
-          status: 410,
-        });
+      if (latest) {
+        const parsed = (await latest.json()) as {
+          chunks?: typeof chunks;
+          downloadFilename?: string | null;
+          downloadKey?: string | null;
+          expiresAt?: number | null;
+          startedAt?: number;
+        };
+        if (
+          typeof parsed.expiresAt === "number" &&
+          parsed.expiresAt <= Date.now()
+        ) {
+          return new Response("Recording expired and was deleted.", {
+            status: 410,
+          });
+        }
+        if (parsed.downloadKey) {
+          return this.streamOgg(
+            parsed.downloadKey,
+            parsed.downloadFilename ??
+              oggDownloadFilename(parsed.startedAt ?? this.state.startedAt),
+          );
+        }
+        if (parsed.chunks?.length) {
+          return this.streamWav(parsed.chunks, this.state.sampleRate);
+        }
       }
-      if (parsed.downloadKey) {
-        return this.streamOgg(
-          parsed.downloadKey,
-          parsed.downloadFilename ??
-            oggDownloadFilename(parsed.startedAt ?? this.state.startedAt),
-        );
+      const recovered = await this.recoverPcmChunksFromR2();
+      if (recovered?.length) {
+        return this.streamWav(recovered, this.state.sampleRate);
       }
-      if (!parsed.chunks?.length) {
-        return new Response("Recording not found.", { status: 404 });
-      }
-      return this.streamWav(parsed.chunks, this.state.sampleRate);
+      return new Response("Recording not found.", { status: 404 });
     }
     return this.streamWav(chunks, this.state.sampleRate);
+  }
+
+  /** Reattach stranded R2 PCM so status/download stay useful after Opus failures. */
+  private async healDownloadableFromR2(): Promise<void> {
+    if (
+      this.state.status === "recording" ||
+      this.state.status === "finalizing" ||
+      this.state.downloadKey ||
+      this.state.chunks.length > 0
+    ) {
+      return;
+    }
+    if (this.state.status === "failed" && this.state.chunks.length === 0) {
+      // fall through to R2 scan
+    } else if (
+      this.state.status !== "idle" &&
+      this.state.status !== "ready" &&
+      this.state.status !== "failed"
+    ) {
+      return;
+    }
+    const recovered = await this.recoverPcmChunksFromR2();
+    if (!recovered?.length) return;
+    this.state.chunks = recovered.map((chunk) => ({
+      bytes: chunk.samples * 2,
+      key: chunk.key,
+      samples: chunk.samples,
+    }));
+    this.state.chunkCount = this.state.chunks.length;
+    this.state.bytesRecorded = this.state.chunks.reduce(
+      (sum, chunk) => sum + chunk.bytes,
+      0,
+    );
+    const recordingMatch = /^[^/]+\/([^/]+)\//.exec(recovered[0]!.key);
+    if (recordingMatch?.[1]) this.state.recordingId = recordingMatch[1];
+    this.markWavReady(
+      "Recovered prior PCM from R2 after encode failure; WAV download available.",
+    );
+    this.state.finalized = true;
+    this.state.releasedForNext = true;
+    this.state.expiresAt ??= Date.now() + RETENTION_MS;
+    await this.writeManifest("recover-r2");
+    await this.persist();
+  }
+
+  /**
+   * When DO state was wiped by a later call but PCM still sits in R2, rebuild a
+   * chunk list from the newest recordingId prefix that has `.pcm` objects.
+   */
+  private async recoverPcmChunksFromR2(): Promise<
+    Array<{ key: string; samples: number }> | null
+  > {
+    const roomId = this.state.roomId;
+    if (!roomId) return null;
+    const listed = await this.env.RECORDINGS.list({
+      prefix: `${roomId}/`,
+      limit: 1000,
+    });
+    const byRecording = new Map<string, string[]>();
+    for (const object of listed.objects) {
+      const match = /^[^/]+\/([^/]+)\/(\d+)\.pcm$/.exec(object.key);
+      if (!match) continue;
+      const recordingId = match[1]!;
+      const keys = byRecording.get(recordingId) ?? [];
+      keys.push(object.key);
+      byRecording.set(recordingId, keys);
+    }
+    if (byRecording.size === 0) return null;
+    let bestId = "";
+    let bestCount = 0;
+    for (const [id, keys] of byRecording) {
+      if (keys.length >= bestCount) {
+        bestId = id;
+        bestCount = keys.length;
+      }
+    }
+    const keys = (byRecording.get(bestId) ?? []).sort();
+    const chunks: Array<{ key: string; samples: number }> = [];
+    for (const key of keys) {
+      const head = await this.env.RECORDINGS.head(key);
+      const samples = Number(head?.customMetadata?.samples ?? 0);
+      if (!head || !Number.isFinite(samples) || samples <= 0) continue;
+      chunks.push({ key, samples });
+    }
+    return chunks.length ? chunks : null;
   }
 
   private async streamOgg(

@@ -10,6 +10,11 @@ import {
   type AuthEnv,
   type AuthenticatedPrincipal,
 } from "./server/auth";
+import {
+  deleteRecordingFromR2,
+  downloadRecordingFromR2,
+  listRecordingsFromR2,
+} from "./server/admin-recordings";
 import { errorResponse, jsonResponse, rpcResponse } from "./server/http";
 import type { RealtimeEnv } from "./server/realtime";
 import { type RoomRpcContext, VideoRoom } from "./server/video-room";
@@ -312,6 +317,32 @@ async function handleExtendedRoute(
     return recordingBinding().fetch("https://recording.internal/download/audio");
   }
 
+  if (url.pathname === "/api/admin/recordings" && request.method === "GET") {
+    assertSameOrigin(request);
+    return listAllAdminRecordings(request, env);
+  }
+
+  if (
+    url.pathname === "/api/admin/recordings/download" &&
+    request.method === "GET"
+  ) {
+    assertSameOrigin(request);
+    return downloadAdminRecording(request, env, url);
+  }
+
+  if (
+    url.pathname === "/api/admin/recordings/delete" &&
+    request.method === "POST"
+  ) {
+    assertSameOrigin(request);
+    return deleteAdminRecording(request, env, url);
+  }
+
+  if (url.pathname === "/api/admin/end-call" && request.method === "POST") {
+    assertSameOrigin(request);
+    return adminEndLiveCall(request, env);
+  }
+
   if (url.pathname === "/api/admin/purge-all" && request.method === "POST") {
     assertSameOrigin(request);
     return purgeAllRoomsAndRecordings(request, env);
@@ -320,19 +351,184 @@ async function handleExtendedRoute(
   return undefined;
 }
 
-async function purgeAllRoomsAndRecordings(
+/** End a live RoomDO call using the host create key (no host browser tab required). */
+async function adminEndLiveCall(
   request: Request,
   env: ExtendedWorkerEnv,
 ): Promise<Response> {
+  assertAdminCreateSecret(request, env);
+  if (!env.ROOM_DO || !env.RECORDING_DO) {
+    throw new RequestError(
+      503,
+      "end_call_unavailable",
+      "Room or recording services are not configured.",
+    );
+  }
+
+  let roomRaw = "";
+  let password = "";
+  try {
+    const body = (await request.json()) as {
+      password?: unknown;
+      room?: unknown;
+    };
+    roomRaw = typeof body.room === "string" ? body.room.trim() : "";
+    password = typeof body.password === "string" ? body.password : "";
+  } catch {
+    throw new RequestError(
+      400,
+      "end_call_body_invalid",
+      "Provide JSON { room, password }.",
+    );
+  }
+
+  const room = validRoom(roomRaw);
+  await checkRoomPassword(env, room, password, false);
+
+  await env.ROOM_DO.getByName(room).fetch(
+    new Request("https://room.internal/admin-end-call", { method: "POST" }),
+  );
+
+  // Best-effort finalize so recording does not keep running after the call dies.
+  await env.RECORDING_DO.getByName(room)
+    .fetch(new Request("https://recording.internal/finalize", { method: "POST" }))
+    .catch(() => undefined);
+
+  return jsonResponse(
+    { ok: true as const, ended: true, room },
+    200,
+    crypto.randomUUID(),
+  );
+}
+
+function assertAdminCreateSecret(
+  request: Request,
+  env: ExtendedWorkerEnv,
+): void {
   const expected = env.ROOM_CREATE_SECRET?.trim() ?? "";
   const provided = (request.headers.get("x-room-create-secret") ?? "").trim();
   if (!expected || !provided || !constantTimeEqual(expected, provided)) {
     throw new RequestError(
       403,
       "room_create_forbidden",
-      "Purging rooms requires the host create key.",
+      "This admin action requires the host create key.",
     );
   }
+}
+
+async function listAllAdminRecordings(
+  request: Request,
+  env: ExtendedWorkerEnv,
+): Promise<Response> {
+  assertAdminCreateSecret(request, env);
+  if (!env.RECORDINGS) {
+    throw new RequestError(
+      503,
+      "recordings_unavailable",
+      "Recording storage is not configured.",
+    );
+  }
+  const recordings = await listRecordingsFromR2(env.RECORDINGS);
+  return jsonResponse(
+    { ok: true as const, recordings, count: recordings.length },
+    200,
+    crypto.randomUUID(),
+  );
+}
+
+async function downloadAdminRecording(
+  request: Request,
+  env: ExtendedWorkerEnv,
+  url: URL,
+): Promise<Response> {
+  assertAdminCreateSecret(request, env);
+  if (!env.RECORDINGS) {
+    throw new RequestError(
+      503,
+      "recordings_unavailable",
+      "Recording storage is not configured.",
+    );
+  }
+  const room = validRoom(url.searchParams.get("room"));
+  const recordingId = (url.searchParams.get("recordingId") ?? "").trim();
+  return downloadRecordingFromR2(env.RECORDINGS, room, recordingId);
+}
+
+async function deleteAdminRecording(
+  request: Request,
+  env: ExtendedWorkerEnv,
+  url: URL,
+): Promise<Response> {
+  assertAdminCreateSecret(request, env);
+  if (!env.RECORDINGS) {
+    throw new RequestError(
+      503,
+      "recordings_unavailable",
+      "Recording storage is not configured.",
+    );
+  }
+
+  let bodyRoom = "";
+  let bodyRecordingId = "";
+  try {
+    const body = (await request.json()) as {
+      recordingId?: unknown;
+      room?: unknown;
+    };
+    bodyRoom = typeof body.room === "string" ? body.room.trim() : "";
+    bodyRecordingId =
+      typeof body.recordingId === "string" ? body.recordingId.trim() : "";
+  } catch {
+    // Query params alone are fine.
+  }
+
+  const room = validRoom(url.searchParams.get("room") ?? bodyRoom ?? null);
+  const recordingId = (
+    url.searchParams.get("recordingId") ?? bodyRecordingId
+  ).trim();
+  if (!/^[0-9a-f-]{36}$/i.test(recordingId)) {
+    throw new RequestError(
+      400,
+      "recording_id_invalid",
+      "A valid recording id is required.",
+    );
+  }
+
+  let result: { deletedObjects: number; roomId: string; recordingId: string };
+  try {
+    result = await deleteRecordingFromR2(env.RECORDINGS, room, recordingId);
+  } catch (error) {
+    throw new RequestError(
+      400,
+      "recording_delete_invalid",
+      error instanceof Error ? error.message : "Could not delete recording.",
+    );
+  }
+
+  if (env.RECORDING_DO) {
+    await env.RECORDING_DO.getByName(room)
+      .fetch(
+        new Request("https://recording.internal/forget-take", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ recordingId }),
+        }),
+      )
+      .catch(() => undefined);
+  }
+
+  return jsonResponse(
+    { ok: true as const, ...result },
+    200,
+    crypto.randomUUID(),
+  );
+}
+
+async function purgeAllRoomsAndRecordings(
+  request: Request,
+  env: ExtendedWorkerEnv,
+): Promise<Response> {
+  assertAdminCreateSecret(request, env);
   if (!env.RECORDINGS || !env.ROOM_DO || !env.RECORDING_DO || !env.ROOMS) {
     throw new RequestError(
       503,

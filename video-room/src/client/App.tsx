@@ -7,10 +7,12 @@ import type {
   RoomController,
   RoomViewState,
 } from "./room-controller";
+import { isNativeVoiceShell } from "./voice-call-session";
 import {
   consumeRoomInviteFromLocation,
   createSecretStorageKey,
   guestIdentity,
+  isListenOnlyInvite,
   passwordStorageKey,
 } from "./ws-bootstrap";
 
@@ -45,7 +47,7 @@ export function App({ controller }: { controller: RoomController }) {
       <div className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-10">
         <RoomHeader
           roomId={controller.roomId}
-          onCopyLink={controller.copyLink}
+          onCopyLink={(listenOnly) => controller.copyLink(listenOnly)}
         />
         <main
           id="main-content"
@@ -82,14 +84,17 @@ export function App({ controller }: { controller: RoomController }) {
                   passwordStorageKey(controller.roomId),
                   password,
                 );
-                if (lobbyMode === "create") {
-                  // Fresh room claim — drop old membership so Create owns host.
+                const reclaiming =
+                  lobbyMode === "create" || createSecret.trim().length >= 8;
+                if (reclaiming) {
+                  // Create or reclaim sticky host with the create key (Telegram-like
+                  // host survives browser close when the key is re-entered).
                   sessionStorage.removeItem("video-room-joined");
                   sessionStorage.removeItem("video-room-token");
                   sessionStorage.removeItem("video-room-pending-token");
                   sessionStorage.setItem(
                     createSecretStorageKey(controller.roomId),
-                    createSecret,
+                    createSecret.trim(),
                   );
                   await new RoomApi(
                     controller.roomId,
@@ -114,7 +119,7 @@ function RoomHeader({
   onCopyLink,
 }: {
   roomId: string;
-  onCopyLink: () => Promise<void>;
+  onCopyLink: (listenOnly?: boolean) => Promise<void>;
 }) {
   return (
     <header className="grid gap-4 rounded-t-xl border border-stone-200 bg-white p-4 sm:flex sm:items-center sm:justify-between sm:px-6">
@@ -160,7 +165,7 @@ function RoomHeader({
       >
         <button
           id="copy-link"
-          onClick={() => void onCopyLink()}
+          onClick={() => void onCopyLink(false)}
           className="inline-flex min-h-11 cursor-pointer grow items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-900 motion-reduce:transition-none sm:grow-0"
           type="button"
         >
@@ -177,7 +182,15 @@ function RoomHeader({
             <rect x="8" y="8" width="12" height="12" rx="2" />
             <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
           </svg>
-          Copy invite link
+          Copy speaker link
+        </button>
+        <button
+          id="copy-listener-link"
+          onClick={() => void onCopyLink(true)}
+          className="inline-flex min-h-11 cursor-pointer grow items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-900 motion-reduce:transition-none sm:grow-0"
+          type="button"
+        >
+          Copy listener link
         </button>
         <button
           id="open-participant"
@@ -258,6 +271,15 @@ function Lobby({
               ? "Invite unlocked — enter your name to join. This room is audio only."
               : "Enter your name and the room password, or open an invite link. This room is audio only."}
         </p>
+        {!creating && (
+          <p className="mt-3 rounded-lg border border-sky-200 bg-sky-50 px-3.5 py-2.5 text-sm leading-6 text-sky-950">
+            Closed the browser mid-call? Enter the{" "}
+            <strong className="font-medium">host create key</strong> below and
+            join — that reclaims host controls so you can End call. Leave stays
+            personal; End call stops everyone.
+          </p>
+        )}
+        <ScreenOffVoiceNotice />
 
         <div
           className="mt-6 inline-flex rounded-lg border border-stone-300 p-1"
@@ -342,38 +364,47 @@ function Lobby({
               />
             </>
           )}
-          {creating && (
-            <>
-              <label
-                htmlFor="host-create-key"
-                className="block text-sm font-medium"
-              >
-                Host create key
-              </label>
-              <input
-                id="host-create-key"
-                value={createSecret}
-                onChange={(event) =>
-                  onCreateSecretChange(event.currentTarget.value)
-                }
-                disabled={nameDisabled}
-                className="min-h-12 w-full min-w-0 rounded-lg border border-stone-500 bg-white px-3.5 py-2.5 text-base shadow-xs placeholder:text-stone-500 enabled:hover:border-stone-600 disabled:cursor-not-allowed disabled:border-stone-300 disabled:bg-stone-100 disabled:text-stone-500"
-                name="host-create-key"
-                type="password"
-                minLength={8}
-                maxLength={256}
-                autoComplete="off"
-                placeholder="Private host create key"
-                required
-              />
-            </>
-          )}
+          <label
+            htmlFor="host-create-key"
+            className="block text-sm font-medium"
+          >
+            Host create key{" "}
+            {!creating && (
+              <span className="font-normal text-stone-500">
+                (optional — reclaim host after closing the browser)
+              </span>
+            )}
+          </label>
+          <input
+            id="host-create-key"
+            value={createSecret}
+            onChange={(event) =>
+              onCreateSecretChange(event.currentTarget.value)
+            }
+            disabled={nameDisabled}
+            className="min-h-12 w-full min-w-0 rounded-lg border border-stone-500 bg-white px-3.5 py-2.5 text-base shadow-xs placeholder:text-stone-500 enabled:hover:border-stone-600 disabled:cursor-not-allowed disabled:border-stone-300 disabled:bg-stone-100 disabled:text-stone-500"
+            name="host-create-key"
+            type="password"
+            minLength={creating ? 8 : undefined}
+            maxLength={256}
+            autoComplete="off"
+            placeholder={
+              creating
+                ? "Private host create key"
+                : "Host create key to reclaim controls"
+            }
+            required={creating}
+          />
           <button
             className="inline-flex min-h-12 w-full cursor-pointer items-center justify-center gap-2 rounded-lg bg-orange-700 px-5 py-3 text-sm font-semibold text-white shadow-xs transition-colors enabled:hover:bg-orange-800 disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none sm:w-auto"
             type="submit"
             disabled={joinDisabled}
           >
-            {creating ? "Create and join" : "Join room"}
+            {creating
+              ? "Create and join"
+              : createSecret.trim().length >= 8
+                ? "Reclaim host & join"
+                : "Join room"}
             <svg
               className="size-4"
               viewBox="0 0 24 24"
@@ -396,7 +427,8 @@ function Lobby({
 
         <p className="mt-6 rounded-lg bg-stone-50 px-4 py-3 text-sm leading-6 text-stone-600">
           Use <strong className="font-medium text-stone-800">Copy invite link</strong>{" "}
-          so guests only enter a name. Only the host create key can open a new room.
+          for speakers, or copy a listener link in-call so guests join muted.
+          Only the host create key can open or reclaim a room.
         </p>
         <RoomDownloads roomId={roomId} />
         <p className="mt-4 text-center text-xs text-stone-500">
@@ -429,6 +461,7 @@ type RecordingStatus = {
   elapsedMs: number;
   finalized: boolean;
   format?: string | null;
+  lastError?: string | null;
   remainingMs: number;
   startedAt?: number | null;
   status: string;
@@ -639,6 +672,7 @@ function Room({
             type: "join",
             displayName: selfName,
             claimHost,
+            listenOnly: isListenOnlyInvite(roomId),
             mediaParticipantId: room.selfId,
           }),
         );
@@ -889,11 +923,20 @@ function Room({
           `Server recording active · ${status.chunkCount} chunks · ${minutes}m elapsed · ${remaining}m left · ${status.adapters}/${status.tracks} adapters`,
         );
       } else if (status.status === "ready") {
-        setRecordingStatus("Recording ready to download.");
+        const note = status.lastError?.trim();
+        setRecordingStatus(
+          note
+            ? `Recording ready (${status.format === "ogg/opus" ? "OGG" : "WAV"}). ${note}`
+            : `Recording ready to download (${status.format === "ogg/opus" ? "OGG Opus" : "WAV"}).`,
+        );
       } else if (status.status === "finalizing") {
         setRecordingStatus("Finalizing server recording…");
       } else if (status.status === "failed") {
-        setRecordingStatus("Recording failed. Partial audio may still download.");
+        setRecordingStatus(
+          status.lastError?.trim()
+            ? `Recording failed: ${status.lastError}`
+            : "Recording failed. Partial audio may still download.",
+        );
       } else {
         setRecordingStatus("Waiting for publishers so server recording can start…");
       }
@@ -1131,8 +1174,16 @@ function Room({
                 onForceUnmute={(id) =>
                   send({ type: "force-unmute", participantId: id, claimHost: true })
                 }
-                onKick={(id) => send({ type: "kick", participantId: id })}
-                onTransfer={(id) => send({ type: "transfer-admin", participantId: id })}
+                onKick={(id) =>
+                  send({ type: "kick", participantId: id, claimHost: true })
+                }
+                onTransfer={(id) =>
+                  send({
+                    type: "transfer-admin",
+                    participantId: id,
+                    claimHost: true,
+                  })
+                }
                 speaking={control?.speaking ?? false}
               />
             );
@@ -1387,6 +1438,28 @@ function RoomDownloads({ roomId }: { roomId: string }) {
       {error && <p className="w-full text-sm text-red-700" role="status">{error}</p>}
     </div>
   );
+}
+
+/** Mobile browsers suspend WebRTC when the screen locks — only the native shell matches Telegram. */
+function ScreenOffVoiceNotice() {
+  if (isNativeVoiceShell() || !isMobileBrowser()) return null;
+  return (
+    <p
+      className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-sm leading-6 text-amber-950"
+      role="note"
+    >
+      On phones, locking the screen stops this browser tab (same as YouTube in
+      Chrome/Safari). Install the Voice Room app for Telegram-like mic and
+      speaker while the display is off. See{" "}
+      <code className="text-xs">mobile/README.md</code> in the project for
+      Android / iOS builds.
+    </p>
+  );
+}
+
+function isMobileBrowser(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
 }
 
 function enforceVoiceOnlyCapture(): void {

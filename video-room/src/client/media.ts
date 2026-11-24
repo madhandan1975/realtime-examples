@@ -203,6 +203,15 @@ export class MediaSessions {
     ]).then(() => undefined);
   }
 
+  /** True when ICE/peer state will not recover without a full media refresh. */
+  needsReconnect(): boolean {
+    if (this.closed) return true;
+    return [this.producer, this.consumer].some((peer) => {
+      const state = peer.connectionState;
+      return state === "failed" || state === "closed" || state === "disconnected";
+    });
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;

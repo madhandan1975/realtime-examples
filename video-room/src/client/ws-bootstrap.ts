@@ -4,6 +4,7 @@
  * Import this module first from main.tsx (side effect runs on load).
  */
 export function installRoomPasswordPropagation(): void {
+  if (typeof window === "undefined") return;
   const originalFetch = window.fetch.bind(window);
   window.fetch = (input, init) => {
     const requestUrl = new URL(
@@ -106,10 +107,24 @@ export function decodeInviteToken(token: string): string | null {
   }
 }
 
-export function buildInviteUrl(roomId: string, password: string): string {
+export function buildInviteUrl(
+  roomId: string,
+  password: string,
+  options?: { listenOnly?: boolean },
+): string {
   const url = new URL(`/rooms/${roomId}`, location.href);
-  url.hash = `invite=${encodeInviteToken(password)}`;
+  const parts = [`invite=${encodeInviteToken(password)}`];
+  if (options?.listenOnly) parts.push("listen=1");
+  url.hash = parts.join("&");
   return url.toString();
+}
+
+export function listenOnlyStorageKey(roomId: string): string {
+  return `video-room-listen-only-${roomId}`;
+}
+
+export function isListenOnlyInvite(roomId: string): boolean {
+  return sessionStorage.getItem(listenOnlyStorageKey(roomId)) === "1";
 }
 
 /**
@@ -135,12 +150,23 @@ export function consumeRoomInviteFromLocation(): string | undefined {
       password = queryPassword;
     }
   }
+  const listenOnly =
+    hashParams.get("listen") === "1" ||
+    url.searchParams.get("listen") === "1";
+  if (listenOnly) {
+    sessionStorage.setItem(listenOnlyStorageKey(roomId), "1");
+  } else if (password) {
+    // Fresh speaker invite / password unlock clears a prior listener latch.
+    sessionStorage.removeItem(listenOnlyStorageKey(roomId));
+  }
+
   if (!password) {
     return sessionStorage.getItem(passwordStorageKey(roomId)) ?? undefined;
   }
 
   sessionStorage.setItem(passwordStorageKey(roomId), password);
   url.searchParams.delete("password");
+  url.searchParams.delete("listen");
   url.hash = "";
   history.replaceState(history.state, "", url);
   return password;
